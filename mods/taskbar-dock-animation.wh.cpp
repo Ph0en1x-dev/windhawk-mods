@@ -196,13 +196,13 @@ You can experiment with the **radius** value to achieve the best result for your
   $name:ko-KR: 시스템 버튼 제외
   $name:pt-BR: Excluir botões do sistema
   $name:it-IT: Escludi pulsanti di sistema
-  $description: 0=Animate all, 1=Exclude Start, 2=Exclude Start/Search/TaskView/Widgets, 3=Animate apps only
-  $description:uk-UA: 0=Анімація всього, 1=Без анімації Start, 2=Без Start/Search/TaskView/Widgets, 3=Анімація тільки іконок застосунків
-  $description:zh-CN: 0=全部动画，1=排除开始，2=排除开始/搜索/任务视图/小组件，3=仅应用图标动画
-  $description:ja-JP: 0=すべてアニメ、1=スタート除外、2=スタート/検索/タスクビュー/ウィジェット除外、3=アプリのみ
-  $description:ko-KR: 0=전체, 1=시작 제외, 2=시작/검색/작업 보기/위젯 제외, 3=앱만
-  $description:pt-BR: 0=Animar tudo, 1=Excluir Iniciar, 2=Excluir Iniciar/Pesquisa/Visão de tarefas/Widgets, 3=Somente apps
-  $description:it-IT: 0=Anima tutto, 1=Escludi Start, 2=Escludi Start/Ricerca/Task View/Widget, 3=Solo app
+  $description: 0=Animate all, 1=Exclude Start, 2=Exclude Start/Search/TaskView/Widgets, 3=Exclude Search/TaskView/Widgets, 4=Animate apps only
+  $description:uk-UA: 0=Анімація всього, 1=Без анімації Start, 2=Без Start/Search/TaskView/Widgets, 3=Без Search/TaskView/Widgets, 4=Анімація тільки іконок застосунків
+  $description:zh-CN: 0=全部动画，1=排除开始，2=排除开始/搜索/任务视图/小组件，3=排除搜索/任务视图/小组件，4=仅应用图标动画
+  $description:ja-JP: 0=すべてアニメ、1=スタート除外、2=スタート/検索/タスクビュー/ウィジェット除外、3=検索/タスクビュー/ウィジェット除外、4=アプリのみ
+  $description:ko-KR: 0=전체, 1=시작 제외, 2=시작/검색/작업 보기/위젯 제외, 3=검색/작업 보기/위젯 제외, 4=앱만
+  $description:pt-BR: 0=Animar tudo, 1=Excluir Iniciar, 2=Excluir Iniciar/Pesquisa/Visão de tarefas/Widgets, 3=Excluir Pesquisa/Visão de tarefas/Widgets, 4=Somente apps
+  $description:it-IT: 0=Anima tutto, 1=Escludi Start, 2=Escludi Start/Ricerca/Task View/Widget, 3=Escludi Ricerca/Task View/Widget, 4=Solo app
 - LerpSpeed: 60
   $name: Smoothing (Lerp speed)
   $name:uk-UA: Плавність (швидкість Lerp)
@@ -677,9 +677,36 @@ static bool ShouldAnimateElement(FrameworkElement const& e) {
 
     ButtonKind k = ClassifyButton(e);
 
-    if (mode == 3) return k == ButtonKind::App;
-    if (mode == 2) return k == ButtonKind::App;
-    if (mode == 1) return k != ButtonKind::Start;
+    auto isSearchTaskViewOrWidgets = [](ButtonKind k) {
+        return k == ButtonKind::Search ||
+               k == ButtonKind::TaskView ||
+               k == ButtonKind::Widgets ||
+               k == ButtonKind::Weather;
+    };
+
+    auto isStartSearchTaskViewOrWidgets = [&](ButtonKind k) {
+        return k == ButtonKind::Start || isSearchTaskViewOrWidgets(k);
+    };
+
+    // 1 = Excluir Iniciar
+    if (mode == 1) {
+        return k != ButtonKind::Start;
+    }
+
+    // 2 = Excluir Iniciar/Pesquisa/Visão de tarefas/Widgets
+    if (mode == 2) {
+        return !isStartSearchTaskViewOrWidgets(k);
+    }
+
+    // 3 = Excluir Pesquisa/Visão de tarefas/Widgets, mas manter Iniciar
+    if (mode == 3) {
+        return !isSearchTaskViewOrWidgets(k);
+    }
+
+    // 4 = Somente apps
+    if (mode == 4) {
+        return k == ButtonKind::App;
+    }
 
     return true;
 }
