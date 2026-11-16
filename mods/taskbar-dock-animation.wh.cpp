@@ -13,7 +13,7 @@
 // @description:ko-KR macOS처럼 마우스를 올리면 작업 표시줄 아이콘이 애니메이션됩니다
 // @description:pt-BR Anima os ícones da barra de tarefas ao passar o mouse, como no macOS
 // @description:it-IT Anima le icone della barra delle applicazioni al passaggio del mouse, come su macOS
-// @version           1.9.2
+// @version           1.9.3
 // @author            Ph0en1x-dev
 // @github            https://github.com/Ph0en1x-dev
 // @include           explorer.exe
@@ -188,7 +188,63 @@ You can experiment with the **radius** value to achieve the best result for your
   $description:ko-KR: 작업 표시줄에 창 제목(직사각형 버튼)이 표시될 때 애니메이션 중앙 정렬을 수정합니다.
   $description:pt-BR: Ative se a barra mostrar títulos de janelas (ícones retangulares) para corrigir o alinhamento.
   $description:it-IT: Abilita se la barra mostra i titoli delle finestre (pulsanti rettangolari) per correggere la centratura.
-- ExcludeSystemButtonsMode: 0
+- ExcludeSystemButtons:
+  - ExcludeApp: false
+    $name: Apps
+    $name:uk-UA: Застосунок
+    $name:zh-CN: 应用
+    $name:ja-JP: アプリ
+    $name:ko-KR: 앱
+    $name:pt-BR: Apps
+    $name:it-IT: App
+  - ExcludeStart: false
+    $name: Start
+    $name:uk-UA: Start
+    $name:zh-CN: 开始
+    $name:ja-JP: スタート
+    $name:ko-KR: 시작
+    $name:pt-BR: Iniciar
+    $name:it-IT: Start
+  - ExcludeSearch: false
+    $name: Search
+    $name:uk-UA: Search
+    $name:zh-CN: 搜索
+    $name:ja-JP: 検索
+    $name:ko-KR: 검색
+    $name:pt-BR: Pesquisa
+    $name:it-IT: Ricerca
+  - ExcludeTaskView: false
+    $name: TaskView
+    $name:uk-UA: TaskView
+    $name:zh-CN: 任务视图
+    $name:ja-JP: タスクビュー
+    $name:ko-KR: 작업 보기
+    $name:pt-BR: Visão de tarefas
+    $name:it-IT: Task View
+  - ExcludeWidgets: true
+    $name: Widgets
+    $name:uk-UA: Widgets
+    $name:zh-CN: 小组件
+    $name:ja-JP: ウィジェット
+    $name:ko-KR: 위젯
+    $name:pt-BR: Widgets
+    $name:it-IT: Widgets
+  - ExcludeWeather: true
+    $name: Weather
+    $name:uk-UA: Погода
+    $name:zh-CN: 天气
+    $name:ja-JP: 天気
+    $name:ko-KR: 날씨
+    $name:pt-BR: Clima
+    $name:it-IT: Meteo
+  - ExcludeSystemOther: true
+    $name: Other
+    $name:uk-UA: Інше
+    $name:zh-CN: 其他
+    $name:ja-JP: その他
+    $name:ko-KR: 기타
+    $name:pt-BR: Outros
+    $name:it-IT: Altro
   $name: Exclude system buttons
   $name:uk-UA: Ігнорувати системні кнопки
   $name:zh-CN: 排除系统按钮
@@ -196,13 +252,13 @@ You can experiment with the **radius** value to achieve the best result for your
   $name:ko-KR: 시스템 버튼 제외
   $name:pt-BR: Excluir botões do sistema
   $name:it-IT: Escludi pulsanti di sistema
-  $description: 0=Animate all, 1=Exclude Start, 2=Exclude Start/Search/TaskView/Widgets, 3=Animate apps only
-  $description:uk-UA: 0=Анімація всього, 1=Без анімації Start, 2=Без Start/Search/TaskView/Widgets, 3=Анімація тільки іконок застосунків
-  $description:zh-CN: 0=全部动画，1=排除开始，2=排除开始/搜索/任务视图/小组件，3=仅应用图标动画
-  $description:ja-JP: 0=すべてアニメ、1=スタート除外、2=スタート/検索/タスクビュー/ウィジェット除外、3=アプリのみ
-  $description:ko-KR: 0=전체, 1=시작 제외, 2=시작/검색/작업 보기/위젯 제외, 3=앱만
-  $description:pt-BR: 0=Animar tudo, 1=Excluir Iniciar, 2=Excluir Iniciar/Pesquisa/Visão de tarefas/Widgets, 3=Somente apps
-  $description:it-IT: 0=Anima tutto, 1=Escludi Start, 2=Escludi Start/Ricerca/Task View/Widget, 3=Solo app
+  $description: Enable to exclude the button type
+  $description:uk-UA: Увімкніть, щоб виключити тип кнопок
+  $description:zh-CN: 启用以排除按钮类型
+  $description:ja-JP: 有効にするとボタンの種類を除外します
+  $description:ko-KR: 사용하면 버튼 유형을 제외합니다
+  $description:pt-BR: Ative para excluir o tipo de botão
+  $description:it-IT: Attiva per escludere il tipo di pulsanti
 - LerpSpeed: 60
   $name: Smoothing (Lerp speed)
   $name:uk-UA: Плавність (швидкість Lerp)
@@ -274,7 +330,14 @@ struct {
     bool mirrorAnimation;
     bool disableVerticalBounce;
     bool taskbarLabelsMode;
-    int excludeSystemButtonsMode;
+    bool excludeApp;
+    bool excludeStart;
+    bool excludeSearch;
+    bool excludeTaskView;
+    bool excludeWidgets;
+    bool excludeWeather;
+    bool excludeSystemOther;
+    int excludeSystemButtonsMask;
     double lerpSpeed;
     bool disableBounce;
 } g_settings;
@@ -619,13 +682,13 @@ static bool SigDifferent(HostSignature const& a, HostSignature const& b) {
 }
 
 enum class ButtonKind {
-    App,
-    Start,
-    Search,
-    TaskView,
-    Widgets,
-    Weather,
-    SystemOther
+    App         = 1 << 0,
+    Start       = 1 << 1,
+    Search      = 1 << 2,
+    TaskView    = 1 << 3,
+    Widgets     = 1 << 4,
+    Weather     = 1 << 5,
+    SystemOther = 1 << 6
 };
 
 static std::wstring W(winrt::hstring const& s) {
@@ -672,16 +735,10 @@ static ButtonKind ClassifyButton(FrameworkElement const& e) {
 
 
 static bool ShouldAnimateElement(FrameworkElement const& e) {
-    const int mode = g_settings.excludeSystemButtonsMode;
-    if (mode == 0) return true;
-
+    int mode = g_settings.excludeSystemButtonsMask;
     ButtonKind k = ClassifyButton(e);
 
-    if (mode == 3) return k == ButtonKind::App;
-    if (mode == 2) return k == ButtonKind::App;
-    if (mode == 1) return k != ButtonKind::Start;
-
-    return true;
+    return mode ? ((int)k & mode) == 0 : true;
 }
 
 static void ResetElementTransforms(FrameworkElement const& element) {
@@ -988,7 +1045,7 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
                 FrameworkElement classifier = FindClassifierNode(child);
                 FrameworkElement base = classifier ? classifier : child;
 
-                bool animate = (g_settings.excludeSystemButtonsMode == 0)
+                bool animate = (g_settings.excludeSystemButtonsMask == 0)
                     ? true
                     : ShouldAnimateElement(base);
 
@@ -1018,7 +1075,7 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
                     FrameworkElement classifier = FindClassifierNode(element);
                     FrameworkElement base = classifier ? classifier : element;
 
-                    bool animate = (g_settings.excludeSystemButtonsMode == 0)
+                    bool animate = (g_settings.excludeSystemButtonsMask == 0)
                         ? true
                         : ShouldAnimateElement(base);
 
@@ -1276,7 +1333,20 @@ void LoadSettings() {
     g_settings.mirrorAnimation = (bool)Wh_GetIntSetting(L"MirrorForTopTaskbar");
     g_settings.disableVerticalBounce = (bool)Wh_GetIntSetting(L"DisableVerticalBounce");
     g_settings.taskbarLabelsMode = (bool)Wh_GetIntSetting(L"TaskbarLabelsMode");
-    g_settings.excludeSystemButtonsMode = Wh_GetIntSetting(L"ExcludeSystemButtonsMode");
+    g_settings.excludeApp = (bool)Wh_GetIntSetting(L"ExcludeSystemButtons.ExcludeApp");
+    g_settings.excludeStart = (bool)Wh_GetIntSetting(L"ExcludeSystemButtons.ExcludeStart");
+    g_settings.excludeSearch = (bool)Wh_GetIntSetting(L"ExcludeSystemButtons.ExcludeSearch");
+    g_settings.excludeTaskView = (bool)Wh_GetIntSetting(L"ExcludeSystemButtons.ExcludeTaskView");
+    g_settings.excludeWidgets = (bool)Wh_GetIntSetting(L"ExcludeSystemButtons.ExcludeWidgets");
+    g_settings.excludeWeather = (bool)Wh_GetIntSetting(L"ExcludeSystemButtons.ExcludeWeather");
+    g_settings.excludeSystemOther = (bool)Wh_GetIntSetting(L"ExcludeSystemButtons.ExcludeSystemOther");
+    g_settings.excludeSystemButtonsMask = (g_settings.excludeApp ? (int)ButtonKind::App : 0) +
+                                          (g_settings.excludeStart ? (int)ButtonKind::Start : 0) +
+                                          (g_settings.excludeSearch ? (int)ButtonKind::Search : 0) + 
+                                          (g_settings.excludeTaskView ? (int)ButtonKind::TaskView : 0) + 
+                                          (g_settings.excludeWidgets ? (int)ButtonKind::Widgets : 0) +
+                                          (g_settings.excludeWeather ? (int)ButtonKind::Weather : 0) +
+                                          (g_settings.excludeSystemOther ? (int)ButtonKind::SystemOther : 0);
 
     g_settings.lerpSpeed = (double)Wh_GetIntSetting(L"LerpSpeed");
     if (g_settings.lerpSpeed < 0) g_settings.lerpSpeed = 0;
@@ -1465,14 +1535,14 @@ void Wh_ModBeforeUninit() {
 void Wh_ModSettingsChanged() {
     Wh_Log(L"DockAnimation: Settings changed.");
     LoadSettings();
-    try {
-        for (auto& pair : g_contexts) {
-            auto& ctx = pair.second;
-            ResetAllIconScales(ctx.icons);
-            ctx.isInitialized = false;
-            ctx.icons.clear();
-        }
-        g_isBouncing = false;
+                try {
+                    for (auto& pair : g_contexts) {
+                        auto& ctx = pair.second;
+                        ResetAllIconScales(ctx.icons);
+                        ctx.isInitialized = false;
+                        ctx.icons.clear();
+                    }
+                    g_isBouncing = false;
     } catch (...) {
     }
 }
