@@ -352,8 +352,13 @@ struct FlipItemAnim {
     double velY = 0.0;
     double scale = 1.0;
     double velScale = 0.0;
+    double enterDelay = 0.0;
+    double fadeElapsed = 0.0;
     bool isTrayItem = false;
+    bool isEntering = false;
+    bool opacityManaged = false;
     bool seenThisPass = false;
+    std::chrono::steady_clock::time_point lastJumpTime{};
 };
 
 struct DockWidthAnimator {
@@ -370,10 +375,20 @@ struct DockWidthAnimator {
     bool isRendering = false;
 
     bool hasBaseline = false;
+    double layoutWidth = 0.0;
     double currentWidth = 0.0;
     double targetWidth = 0.0;
     double widthVelocity = 0.0;
     bool pillAnimating = false;
+
+    bool shrinkPending = false;
+    bool shrinkAnimActive = false;
+    double shrinkStartWidth = 0.0;
+    double shrinkStartVelocity = 0.0;
+    double shrinkElapsed = 0.0;
+    double shrinkDuration = 0.42;
+    DispatcherTimer shrinkTimer{nullptr};
+    DispatcherTimer::Tick_revoker shrinkTimerRevoker;
 
     bool flipBaselineReady = false;
     std::unordered_map<void*, FlipItemAnim> flipItems;
@@ -1233,6 +1248,49 @@ static void StepCriticalSpring(double& x, double& v, double target, double omega
     v = newV;
 }
 
+constexpr int kDefaultCollapseDelayMs = 900;
+constexpr double kDefaultCollapseDurationSec = 0.42;
+
+static void StepDampedSpring(double& x, double& v, double target,
+                             double omega, double zeta, double dt) {
+    if (zeta >= 0.999) {
+        StepCriticalSpring(x, v, target, omega, dt);
+        return;
+    }
+    double disp = x - target;
+    double wd = omega * std::sqrt(1.0 - zeta * zeta);
+    double decay = std::exp(-zeta * omega * dt);
+    double cosT = std::cos(wd * dt);
+    double sinT = std::sin(wd * dt);
+    double A = disp;
+    double B = (v + zeta * omega * disp) / wd;
+    x = target + decay * (A * cosT + B * sinT);
+    v = decay * ((B * wd - A * zeta * omega) * cosT -
+                 (A * wd + B * zeta * omega) * sinT);
+}
+
+static void ClearManagedOpacity(FrameworkElement const& el, FlipItemAnim& item) {
+    if (!item.opacityManaged) return;
+    item.opacityManaged = false;
+    if (!el) return;
+    try {
+        el.ClearValue(UIElement::OpacityProperty());
+    } catch (...) {
+        try { el.Opacity(1.0); } catch (...) {}
+    }
+}
+
+static void ClearBgGridTransforms(FrameworkElement const& bgGrid) {
+    if (!bgGrid) return;
+    try {
+        auto rt = bgGrid.RenderTransform();
+        if (rt && (rt.try_as<ScaleTransform>() || rt.try_as<TransformGroup>())) {
+            bgGrid.ClearValue(UIElement::RenderTransformProperty());
+            bgGrid.ClearValue(UIElement::RenderTransformOriginProperty());
+        }
+    } catch (...) {}
+}
+
 static double GetChildLayoutX(FrameworkElement const& child,
                               FrameworkElement const& sysTray) {
     double lx = 0.0;
@@ -1300,6 +1358,29 @@ static bool IsTaskListButtonClass(FrameworkElement const& e) {
     }
 }
 
+static void CancelPendingShrink(DockWidthAnimator& a) {
+    a.shrinkPending = false;
+    if (a.shrinkTimer) {
+        try { a.shrinkTimer.Stop(); } catch (...) {}
+    }
+}
+
+static void StartShrinkEase(DockWidthAnimator& a, double destWidth) {
+    a.targetWidth = destWidth;
+    a.shrinkStartWidth = a.currentWidth;
+    a.shrinkStartVelocity = a.widthVelocity;
+    a.shrinkElapsed = 0.0;
+    double dist = std::abs(a.currentWidth - destWidth);
+    double baseDur = kDefaultCollapseDurationSec;
+    a.shrinkDuration = std::clamp(
+        baseDur * std::clamp(std::sqrt(std::max(dist, 1.0) / 56.0), 0.78, 1.15),
+        0.18, 1.50);
+    a.shrinkAnimActive = true;
+    a.pillAnimating = true;
+}
+
+static void ArmPendingShrink(std::shared_ptr<DockWidthAnimator> const& a);
+
 static void StartDockAnimatorLoop(std::shared_ptr<DockWidthAnimator> const& a) {
     if (!a || a->isRendering || g_unloading.load()) return;
     a->lastTick = std::chrono::steady_clock::now();
@@ -1333,22 +1414,83 @@ static void StartDockAnimatorLoop(std::shared_ptr<DockWidthAnimator> const& a) {
                 sa->lastTick = now;
                 dt = std::clamp(dt, 0.001, 0.025);
 
-                constexpr double kOmegaMove = 16.0;
-                constexpr double kOmegaEnter = 19.0;
+                constexpr double kOmegaMove = 13.5;
+                constexpr double kOmegaCloseSlide = 9.2;
+                constexpr double kOmegaEnterScale = 12.0;
+                constexpr double kZetaEnterScale = 0.82;
+                constexpr double kOmegaEnterY = 11.5;
+                constexpr double kZetaEnterY = 0.86;
+                constexpr double kEnterFadeDuration = 0.16;
 
                 if (sa->pillAnimating) {
-                    StepCriticalSpring(sa->currentWidth, sa->widthVelocity, sa->targetWidth, kOmegaMove, dt);
-                    if (std::abs(sa->currentWidth - sa->targetWidth) < 0.12 &&
-                        std::abs(sa->widthVelocity) < 0.8) {
-                        sa->currentWidth = sa->targetWidth;
-                        sa->widthVelocity = 0.0;
-                        sa->pillAnimating = false;
+                    if (sa->shrinkAnimActive) {
+                        sa->shrinkElapsed += dt;
+                        double T = std::max(sa->shrinkDuration, 0.05);
+                        double u = std::clamp(sa->shrinkElapsed / T, 0.0, 1.0);
+                        double p0 = sa->shrinkStartWidth;
+                        double p1 = sa->targetWidth;
+                        if (std::abs(sa->shrinkStartVelocity) < 1.0) {
+                            double s = u * u * u * (u * (6.0 * u - 15.0) + 10.0);
+                            double ds = 30.0 * u * u * (1.0 - u) * (1.0 - u);
+                            sa->currentWidth = p0 + (p1 - p0) * s;
+                            sa->widthVelocity = (p1 - p0) * ds / T;
+                        } else {
+                            double maxSpan = std::abs(p1 - p0);
+                            double m0 = std::clamp(sa->shrinkStartVelocity * T, -2.0 * maxSpan, 2.0 * maxSpan);
+                            double u2 = u * u;
+                            double u3 = u2 * u;
+                            double h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
+                            double h10 = u3 - 2.0 * u2 + u;
+                            double h01 = -2.0 * u3 + 3.0 * u2;
+                            sa->currentWidth = h00 * p0 + h10 * m0 + h01 * p1;
+                            double dh00 = 6.0 * u2 - 6.0 * u;
+                            double dh10 = 3.0 * u2 - 4.0 * u + 1.0;
+                            double dh01 = -6.0 * u2 + 6.0 * u;
+                            sa->widthVelocity = (dh00 * p0 + dh10 * m0 + dh01 * p1) / T;
+                        }
+                        if (u >= 1.0 - 1e-4) {
+                            sa->currentWidth = p1;
+                            sa->widthVelocity = 0.0;
+                            sa->shrinkAnimActive = false;
+                            sa->pillAnimating = false;
+                        }
+                    } else {
+                        StepCriticalSpring(sa->currentWidth, sa->widthVelocity, sa->targetWidth, kOmegaMove, dt);
+                        if (std::abs(sa->currentWidth - sa->targetWidth) < 0.12 &&
+                            std::abs(sa->widthVelocity) < 0.8) {
+                            sa->currentWidth = sa->targetWidth;
+                            sa->widthVelocity = 0.0;
+                            sa->pillAnimating = false;
+                        }
+                    }
+
+                    if (!sa->pillAnimating && !sa->shrinkPending &&
+                        std::abs(sa->layoutWidth - sa->currentWidth) < 0.5) {
                         try { ctrl.Margin(Thickness{0, 0, 0, 0}); } catch (...) {}
                     } else {
-                        double delta = std::clamp((sa->targetWidth - sa->currentWidth) * 0.5, -350.0, 350.0);
+                        double delta = std::clamp((sa->layoutWidth - sa->currentWidth) * 0.5, -350.0, 350.0);
                         try { ctrl.Margin(Thickness{delta, 0, delta, 0}); } catch (...) {}
                     }
+
+                    if (!sa->pillAnimating && !sa->shrinkPending &&
+                        sa->layoutWidth < sa->currentWidth - 0.5) {
+                        ArmPendingShrink(sa);
+                    }
                 }
+
+                bool anyEnteringOrExpanding =
+                    (sa->pillAnimating && !sa->shrinkAnimActive &&
+                     sa->targetWidth > sa->currentWidth + 0.5);
+                if (!anyEnteringOrExpanding) {
+                    for (auto const& kv : sa->flipItems) {
+                        if (!kv.second.isTrayItem &&
+                            (kv.second.isEntering || kv.second.enterDelay > 0.0)) {
+                            anyEnteringOrExpanding = true;
+                            break;
+                        }
+                    }
+                }
+                double slideOmega = anyEnteringOrExpanding ? kOmegaMove : kOmegaCloseSlide;
 
                 bool anyFlipActive = false;
                 for (auto it = sa->flipItems.begin(); it != sa->flipItems.end(); ) {
@@ -1360,13 +1502,15 @@ static void StartDockAnimatorLoop(std::shared_ptr<DockWidthAnimator> const& a) {
                     auto& item = it->second;
                     bool wasActive =
                         (item.offsetX != 0.0 || item.velX != 0.0 ||
-                         (!item.isTrayItem && (item.offsetY != 0.0 || item.velY != 0.0 ||
+                         (!item.isTrayItem && (item.isEntering || item.enterDelay > 0.0 ||
+                                               item.opacityManaged ||
+                                               item.offsetY != 0.0 || item.velY != 0.0 ||
                                                item.scale != 1.0 || item.velScale != 0.0)));
 
                     if (wasActive) {
-                        if (std::abs(item.offsetX) >= 0.12 || std::abs(item.velX) >= 0.8) {
-                            StepCriticalSpring(item.offsetX, item.velX, 0.0, kOmegaMove, dt);
-                            if (std::abs(item.offsetX) < 0.12 && std::abs(item.velX) < 0.8) {
+                        if (std::abs(item.offsetX) >= 0.10 || std::abs(item.velX) >= 0.6) {
+                            StepCriticalSpring(item.offsetX, item.velX, 0.0, slideOmega, dt);
+                            if (std::abs(item.offsetX) < 0.10 && std::abs(item.velX) < 0.6) {
                                 item.offsetX = 0.0;
                                 item.velX = 0.0;
                             }
@@ -1375,34 +1519,64 @@ static void StartDockAnimatorLoop(std::shared_ptr<DockWidthAnimator> const& a) {
                             item.velX = 0.0;
                         }
 
-                        if (!item.isTrayItem) {
-                            if (std::abs(item.offsetY) >= 0.12 || std::abs(item.velY) >= 0.8) {
-                                StepCriticalSpring(item.offsetY, item.velY, 0.0, kOmegaEnter, dt);
-                                if (std::abs(item.offsetY) < 0.12 && std::abs(item.velY) < 0.8) {
+                        if (!item.isTrayItem &&
+                            (item.isEntering || item.enterDelay > 0.0 || item.opacityManaged ||
+                             item.offsetY != 0.0 || item.velY != 0.0 ||
+                             item.scale != 1.0 || item.velScale != 0.0)) {
+                            if (item.enterDelay > 0.0) {
+                                item.enterDelay = std::max(0.0, item.enterDelay - dt);
+                                if (item.opacityManaged) {
+                                    try { el.Opacity(0.0); } catch (...) {}
+                                }
+                            } else {
+                                if (item.opacityManaged) {
+                                    item.fadeElapsed += dt;
+                                    double u = std::clamp(item.fadeElapsed / kEnterFadeDuration, 0.0, 1.0);
+                                    if (u >= 0.999) {
+                                        ClearManagedOpacity(el, item);
+                                    } else {
+                                        double inv = 1.0 - u;
+                                        double op = 1.0 - inv * inv * inv;
+                                        try { el.Opacity(op); } catch (...) {}
+                                    }
+                                }
+
+                                if (std::abs(item.offsetY) >= 0.08 || std::abs(item.velY) >= 0.5) {
+                                    StepDampedSpring(item.offsetY, item.velY, 0.0, kOmegaEnterY, kZetaEnterY, dt);
+                                    if (std::abs(item.offsetY) < 0.08 && std::abs(item.velY) < 0.5) {
+                                        item.offsetY = 0.0;
+                                        item.velY = 0.0;
+                                    }
+                                } else {
                                     item.offsetY = 0.0;
                                     item.velY = 0.0;
                                 }
-                            } else {
-                                item.offsetY = 0.0;
-                                item.velY = 0.0;
-                            }
 
-                            if (std::abs(item.scale - 1.0) >= 0.004 || std::abs(item.velScale) >= 0.05) {
-                                StepCriticalSpring(item.scale, item.velScale, 1.0, kOmegaEnter, dt);
-                                if (std::abs(item.scale - 1.0) < 0.004 && std::abs(item.velScale) < 0.05) {
+                                if (std::abs(item.scale - 1.0) >= 0.002 || std::abs(item.velScale) >= 0.03) {
+                                    StepDampedSpring(item.scale, item.velScale, 1.0, kOmegaEnterScale, kZetaEnterScale, dt);
+                                    if (std::abs(item.scale - 1.0) < 0.002 && std::abs(item.velScale) < 0.03) {
+                                        item.scale = 1.0;
+                                        item.velScale = 0.0;
+                                    }
+                                } else {
                                     item.scale = 1.0;
                                     item.velScale = 0.0;
                                 }
-                            } else {
-                                item.scale = 1.0;
-                                item.velScale = 0.0;
+
+                                if (!item.opacityManaged &&
+                                    item.offsetY == 0.0 && item.velY == 0.0 &&
+                                    item.scale == 1.0 && item.velScale == 0.0) {
+                                    item.isEntering = false;
+                                }
                             }
                         }
 
                         ApplyFlipTransform(el, item.offsetX, item.offsetY, item.scale, !item.isTrayItem);
 
                         if (item.offsetX != 0.0 || item.velX != 0.0 ||
-                            (!item.isTrayItem && (item.offsetY != 0.0 || item.velY != 0.0 ||
+                            (!item.isTrayItem && (item.isEntering || item.enterDelay > 0.0 ||
+                                                  item.opacityManaged ||
+                                                  item.offsetY != 0.0 || item.velY != 0.0 ||
                                                   item.scale != 1.0 || item.velScale != 0.0))) {
                             anyFlipActive = true;
                         }
@@ -1418,9 +1592,60 @@ static void StartDockAnimatorLoop(std::shared_ptr<DockWidthAnimator> const& a) {
         });
 }
 
+static void ArmPendingShrink(std::shared_ptr<DockWidthAnimator> const& a) {
+    if (!a || g_unloading.load()) return;
+    int delayMs = kDefaultCollapseDelayMs;
+    if (delayMs <= 0) {
+        CancelPendingShrink(*a);
+        StartShrinkEase(*a, a->layoutWidth);
+        StartDockAnimatorLoop(a);
+        return;
+    }
+
+    a->shrinkPending = true;
+    if (!a->shrinkTimer) {
+        a->shrinkTimer = DispatcherTimer();
+        std::weak_ptr<DockWidthAnimator> weakAnim = a;
+        a->shrinkTimerRevoker = a->shrinkTimer.Tick(
+            winrt::auto_revoke,
+            [weakAnim](winrt::Windows::Foundation::IInspectable const&,
+                       winrt::Windows::Foundation::IInspectable const&) {
+                if (g_unloading.load()) return;
+                auto sa = weakAnim.lock();
+                if (!sa) return;
+                if (sa->shrinkTimer) {
+                    try { sa->shrinkTimer.Stop(); } catch (...) {}
+                }
+                if (!sa->shrinkPending) return;
+                sa->shrinkPending = false;
+                if (sa->layoutWidth < sa->currentWidth - 0.5) {
+                    StartShrinkEase(*sa, sa->layoutWidth);
+                    StartDockAnimatorLoop(sa);
+                } else {
+                    sa->targetWidth = sa->layoutWidth;
+                    if (auto ctrl = sa->bgControl.get()) {
+                        double d = std::clamp((sa->layoutWidth - sa->currentWidth) * 0.5, -350.0, 350.0);
+                        try { ctrl.Margin(Thickness{d, 0, d, 0}); } catch (...) {}
+                    }
+                }
+            });
+    } else {
+        try { a->shrinkTimer.Stop(); } catch (...) {}
+    }
+    a->shrinkTimer.Interval(std::chrono::milliseconds{delayMs});
+    a->shrinkTimer.Start();
+}
+
 void DetachDockWidthAnimator(DockAnimationContext& ctx) {
     if (!ctx.widthAnim) return;
     auto& a = *ctx.widthAnim;
+    a.shrinkPending = false;
+    a.shrinkAnimActive = false;
+    a.shrinkTimerRevoker.revoke();
+    if (a.shrinkTimer) {
+        try { a.shrinkTimer.Stop(); } catch (...) {}
+        a.shrinkTimer = nullptr;
+    }
     if (a.isRendering) {
         try {
             Media::CompositionTarget::Rendering(a.renderingToken);
@@ -1449,8 +1674,12 @@ void DetachDockWidthAnimator(DockAnimationContext& ctx) {
             ctrl.Margin(Thickness{0, 0, 0, 0});
         } catch (...) {}
     }
-    for (auto const& kv : a.flipItems) {
+    if (auto g = a.bgGrid.get()) {
+        ClearBgGridTransforms(g);
+    }
+    for (auto& kv : a.flipItems) {
         if (auto el = kv.second.element.get()) {
+            ClearManagedOpacity(el, kv.second);
             ApplyFlipTransform(el, 0.0, 0.0, 1.0, !kv.second.isTrayItem);
         }
     }
@@ -1508,6 +1737,7 @@ void AttachDockWidthAnimator(DockAnimationContext& ctx,
     }
     anim->repeater = repeater;
 
+    ClearBgGridTransforms(bgGrid);
     try { bgCtrl.Margin(Thickness{0, 0, 0, 0}); } catch (...) {}
 
     double rootW = static_cast<double>(rootGrid.ActualWidth());
@@ -1515,6 +1745,7 @@ void AttachDockWidthAnimator(DockAnimationContext& ctx,
         auto m = bgGrid.Margin();
         double initW = rootW - m.Left - m.Right;
         if (initW >= 100.0 && initW <= rootW) {
+            anim->layoutWidth = initW;
             anim->currentWidth = initW;
             anim->targetWidth = initW;
             anim->hasBaseline = true;
@@ -1543,6 +1774,7 @@ void AttachDockWidthAnimator(DockAnimationContext& ctx,
                 }
 
                 if (!a->hasBaseline) {
+                    a->layoutWidth = newTarget;
                     a->currentWidth = newTarget;
                     a->targetWidth = newTarget;
                     a->widthVelocity = 0.0;
@@ -1550,12 +1782,15 @@ void AttachDockWidthAnimator(DockAnimationContext& ctx,
                     return;
                 }
 
-                if (std::abs(newTarget - a->targetWidth) < 0.5) {
-                    a->targetWidth = newTarget;
+                if (std::abs(newTarget - a->layoutWidth) < 0.5) {
+                    a->layoutWidth = newTarget;
                     return;
                 }
 
                 if (std::abs(newTarget - a->currentWidth) > 650.0) {
+                    CancelPendingShrink(*a);
+                    a->shrinkAnimActive = false;
+                    a->layoutWidth = newTarget;
                     a->currentWidth = newTarget;
                     a->targetWidth = newTarget;
                     a->widthVelocity = 0.0;
@@ -1564,11 +1799,34 @@ void AttachDockWidthAnimator(DockAnimationContext& ctx,
                     return;
                 }
 
-                a->targetWidth = newTarget;
-                a->pillAnimating = true;
-                double sideDelta = std::clamp((a->targetWidth - a->currentWidth) * 0.5, -350.0, 350.0);
+                a->layoutWidth = newTarget;
+                double sideDelta = std::clamp((a->layoutWidth - a->currentWidth) * 0.5, -350.0, 350.0);
                 bgC.Margin(Thickness{sideDelta, 0, sideDelta, 0});
-                StartDockAnimatorLoop(a);
+
+                if (newTarget >= a->currentWidth - 0.5) {
+                    CancelPendingShrink(*a);
+                    a->shrinkAnimActive = false;
+                    a->targetWidth = newTarget;
+                    if (std::abs(newTarget - a->currentWidth) >= 0.5 || std::abs(a->widthVelocity) >= 0.8) {
+                        a->pillAnimating = true;
+                        StartDockAnimatorLoop(a);
+                    } else {
+                        a->currentWidth = newTarget;
+                        a->widthVelocity = 0.0;
+                        a->pillAnimating = false;
+                        bgC.Margin(Thickness{0, 0, 0, 0});
+                    }
+                } else if (a->shrinkAnimActive && newTarget > a->targetWidth + 0.5) {
+                    CancelPendingShrink(*a);
+                    StartShrinkEase(*a, newTarget);
+                    StartDockAnimatorLoop(a);
+                } else {
+                    if (!a->pillAnimating) {
+                        a->targetWidth = a->currentWidth;
+                        a->widthVelocity = 0.0;
+                    }
+                    ArmPendingShrink(a);
+                }
             } catch (...) {}
         });
 
@@ -1598,8 +1856,20 @@ void AttachDockWidthAnimator(DockAnimationContext& ctx,
                     kv.second.seenThisPass = false;
                 }
 
+                struct VisibleChildSnapshot {
+                    FrameworkElement child;
+                    void* key;
+                    FrameworkElement sysTray;
+                    bool isTray;
+                    double lx;
+                };
+
+                std::vector<VisibleChildSnapshot> visibleChildren;
+                visibleChildren.reserve(static_cast<size_t>(count));
+
                 bool needRender = false;
                 bool anyVisible = false;
+                auto now = std::chrono::steady_clock::now();
 
                 for (int i = 0; i < count; i++) {
                     auto child = VisualTreeHelper::GetChild(rep, i).try_as<FrameworkElement>();
@@ -1610,61 +1880,158 @@ void AttachDockWidthAnimator(DockAnimationContext& ctx,
                     anyVisible = true;
                     void* key = winrt::get_abi(child);
 
+                    FrameworkElement sysTray = nullptr;
+                    bool isTray = false;
                     auto it = a->flipItems.find(key);
-                    if (it == a->flipItems.end()) {
-                        FrameworkElement sysTray = nullptr;
-                        bool isTray = false;
-                        if (winrt::get_class_name(child) == L"Taskbar.TaskbarExtensionElement") {
+                    if (it != a->flipItems.end()) {
+                        isTray = it->second.isTrayItem;
+                        sysTray = it->second.sysTray.get();
+                        if (isTray && !sysTray) {
                             sysTray = FindDescendantSystemTrayFrame(child, 4);
-                            isTray = (sysTray != nullptr);
+                            if (sysTray) it->second.sysTray = sysTray;
                         }
-                        double lx = GetChildLayoutX(child, sysTray);
+                    } else if (winrt::get_class_name(child) == L"Taskbar.TaskbarExtensionElement") {
+                        sysTray = FindDescendantSystemTrayFrame(child, 4);
+                        isTray = (sysTray != nullptr);
+                    }
 
-                        FlipItemAnim item;
-                        item.element = child;
-                        item.sysTray = sysTray;
-                        item.lastLayoutX = lx;
-                        item.isTrayItem = isTray;
-                        item.seenThisPass = true;
+                    double lx = GetChildLayoutX(child, sysTray);
+                    visibleChildren.push_back({std::move(child), key, std::move(sysTray), isTray, lx});
+                }
 
-                        if (a->flipBaselineReady && !isTray && IsTaskListButtonClass(child)) {
-                            float yOrigin = g_settings.disableVerticalBounce
-                                ? 0.5f
-                                : (g_settings.mirrorAnimation ? 0.0f : 1.0f);
-                            child.RenderTransformOrigin({ 0.5f, yOrigin });
-                            item.scale = 0.45;
-                            item.velScale = 0.0;
-                            item.offsetY = 6.0;
-                            item.velY = 0.0;
-                            ApplyFlipTransform(child, 0.0, 6.0, 0.45, true);
+                std::vector<std::pair<void*, double>> recenterDelayed;
+                std::vector<VisibleChildSnapshot*> newChildren;
+                std::vector<std::pair<double, double>> anchorOffsets;
+                anchorOffsets.reserve(visibleChildren.size());
+
+                // Pass A: update existing tracked items and absorb two-pass layout shifts.
+                for (auto& snap : visibleChildren) {
+                    auto it = a->flipItems.find(snap.key);
+                    if (it == a->flipItems.end()) {
+                        newChildren.push_back(&snap);
+                        continue;
+                    }
+
+                    auto& item = it->second;
+                    item.seenThisPass = true;
+                    double dx = item.lastLayoutX - snap.lx;
+
+                    if (!item.isTrayItem && item.enterDelay > 0.0) {
+                        if (std::isfinite(dx) && std::abs(dx) >= 0.5) {
+                            item.lastLayoutX = snap.lx;
+                            recenterDelayed.push_back({snap.key, snap.lx});
+                        }
+                    } else if (std::isfinite(dx) && std::abs(dx) >= 0.5) {
+                        if (std::abs(dx) <= 450.0) {
+                            double prevOffset = item.offsetX;
+                            double nextOffset = std::clamp(prevOffset + dx, -450.0, 450.0);
+                            if ((prevOffset > 0.5 && dx < -0.5) || (prevOffset < -0.5 && dx > 0.5)) {
+                                bool recentJump =
+                                    (item.lastJumpTime != std::chrono::steady_clock::time_point{}) &&
+                                    (std::chrono::duration<double, std::milli>(now - item.lastJumpTime).count() < 50.0);
+                                if ((prevOffset * nextOffset <= 0.0) ||
+                                    std::abs(nextOffset) < 1.5 ||
+                                    recentJump) {
+                                    item.velX = 0.0;
+                                    if (std::abs(nextOffset) < 1.0) {
+                                        nextOffset = 0.0;
+                                    }
+                                }
+                            }
+                            item.offsetX = nextOffset;
+                            item.lastJumpTime = now;
+                            ApplyFlipTransform(snap.child, item.offsetX, item.offsetY, item.scale, !item.isTrayItem);
+                            if (item.offsetX != 0.0 || item.velX != 0.0) {
+                                needRender = true;
+                            }
+                        } else {
+                            item.offsetX = 0.0;
+                            item.velX = 0.0;
+                            ApplyFlipTransform(snap.child, 0.0, item.offsetY, item.scale, !item.isTrayItem);
+                        }
+                        item.lastLayoutX = snap.lx;
+                    }
+
+                    if (!item.isEntering && item.enterDelay <= 0.0) {
+                        anchorOffsets.push_back({item.lastLayoutX, item.offsetX});
+                    }
+                }
+
+                std::sort(anchorOffsets.begin(), anchorOffsets.end(),
+                    [](auto const& lhs, auto const& rhs) {
+                        return lhs.first < rhs.first;
+                    });
+
+                auto computeSeamOffset = [&](double targetLx) -> double {
+                    bool hasLeft = false;
+                    bool hasRight = false;
+                    double leftOff = 0.0;
+                    double rightOff = 0.0;
+                    for (auto const& anc : anchorOffsets) {
+                        if (anc.first < targetLx - 0.5) {
+                            hasLeft = true;
+                            leftOff = anc.second;
+                        } else if (anc.first > targetLx + 0.5) {
+                            hasRight = true;
+                            rightOff = anc.second;
+                            break;
+                        }
+                    }
+                    double seedX = 0.0;
+                    if (hasLeft && hasRight) {
+                        seedX = (leftOff + rightOff) * 0.5;
+                    } else if (hasLeft) {
+                        seedX = leftOff * 0.5;
+                    } else if (hasRight) {
+                        seedX = rightOff * 0.5;
+                    }
+                    return std::clamp(seedX, -48.0, 48.0);
+                };
+
+                // Pass B: re-center delayed hidden entrants and initialize new icons.
+                for (auto const& delayed : recenterDelayed) {
+                    auto it = a->flipItems.find(delayed.first);
+                    if (it != a->flipItems.end()) {
+                        auto& item = it->second;
+                        if (auto el = item.element.get()) {
+                            item.offsetX = computeSeamOffset(delayed.second);
+                            item.velX = 0.0;
+                            ApplyFlipTransform(el, item.offsetX, item.offsetY, item.scale, !item.isTrayItem);
                             needRender = true;
                         }
-
-                        a->flipItems.emplace(key, std::move(item));
-                    } else {
-                        auto& item = it->second;
-                        item.seenThisPass = true;
-                        auto sysTray = item.sysTray.get();
-                        if (item.isTrayItem && !sysTray) {
-                            sysTray = FindDescendantSystemTrayFrame(child, 4);
-                            if (sysTray) item.sysTray = sysTray;
-                        }
-                        double lx = GetChildLayoutX(child, sysTray);
-
-                        double dx = item.lastLayoutX - lx;
-                        if (std::isfinite(dx) && std::abs(dx) >= 0.5) {
-                            if (std::abs(dx) <= 450.0) {
-                                item.offsetX = std::clamp(item.offsetX + dx, -450.0, 450.0);
-                                ApplyFlipTransform(child, item.offsetX, item.offsetY, item.scale, !item.isTrayItem);
-                                needRender = true;
-                            } else {
-                                item.offsetX = 0.0;
-                                item.velX = 0.0;
-                                ApplyFlipTransform(child, 0.0, item.offsetY, item.scale, !item.isTrayItem);
-                            }
-                        }
-                        item.lastLayoutX = lx;
                     }
+                }
+
+                for (auto* snapPtr : newChildren) {
+                    auto& snap = *snapPtr;
+                    FlipItemAnim item;
+                    item.element = snap.child;
+                    item.sysTray = snap.sysTray;
+                    item.lastLayoutX = snap.lx;
+                    item.isTrayItem = snap.isTray;
+                    item.seenThisPass = true;
+
+                    if (a->flipBaselineReady && !snap.isTray && IsTaskListButtonClass(snap.child)) {
+                        float yOrigin = g_settings.disableVerticalBounce
+                            ? 0.5f
+                            : (g_settings.mirrorAnimation ? 0.0f : 1.0f);
+                        snap.child.RenderTransformOrigin({ 0.5f, yOrigin });
+                        item.offsetX = computeSeamOffset(snap.lx);
+                        item.velX = 0.0;
+                        item.scale = 0.22;
+                        item.velScale = 0.0;
+                        item.offsetY = g_settings.mirrorAnimation ? -14.0 : 14.0;
+                        item.velY = 0.0;
+                        item.enterDelay = 0.065;
+                        item.fadeElapsed = 0.0;
+                        item.isEntering = true;
+                        item.opacityManaged = true;
+                        try { snap.child.Opacity(0.0); } catch (...) {}
+                        ApplyFlipTransform(snap.child, item.offsetX, item.offsetY, item.scale, true);
+                        needRender = true;
+                    }
+
+                    a->flipItems.emplace(snap.key, std::move(item));
                 }
 
                 if (anyVisible) {
@@ -1674,6 +2041,7 @@ void AttachDockWidthAnimator(DockAnimationContext& ctx,
                 for (auto it = a->flipItems.begin(); it != a->flipItems.end(); ) {
                     if (!it->second.seenThisPass) {
                         if (auto el = it->second.element.get()) {
+                            ClearManagedOpacity(el, it->second);
                             ApplyFlipTransform(el, 0.0, 0.0, 1.0, !it->second.isTrayItem);
                         }
                         it = a->flipItems.erase(it);
