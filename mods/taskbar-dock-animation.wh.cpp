@@ -233,6 +233,20 @@ You can experiment with the **radius** value to achieve the best result for your
   $description:ko-KR: 대기 상태 ‘호흡’ 바운스를 완전히 비활성화합니다
   $description:pt-BR: Desativa totalmente o bounce ocioso (“respirar”)
   $description:it-IT: Disattiva completamente il bounce inattivo (“respiro”)
+- SmoothLayoutTransition: false
+  $name: Smooth Dock layout transition (FLIP + capsule width)
+  $name:zh-CN: 平滑 Dock 布局与宽度过渡动画（FLIP）
+  $description: >-
+    Animates icon/tray horizontal layout shifts, newly opened taskbar buttons,
+    and dynamic TaskbarBackground Margin changes (for auto-width floating dock
+    themes in Windows 11 Taskbar Styler). When using separated/in-frame tray
+    dock themes, pair with Transitions:=<TransitionCollection /> on
+    SystemTray.SystemTrayFrame in Taskbar Styler.
+  $description:zh-CN: >-
+    为图标/托盘横向位移、新打开应用图标及自适应悬浮 Dock 胶囊宽度变化
+    （TaskbarBackground Margin）提供平滑弹簧过渡动画。若在 Taskbar Styler
+    中使用嵌入式托盘 Dock 主题，建议同时将 SystemTrayFrame 的 Transitions 设为
+    <TransitionCollection /> 以避免系统重排动画叠加。
 */
 // ==/WindhawkModSettings==
 
@@ -242,6 +256,7 @@ You can experiment with the **radius** value to achieve the best result for your
 #include <windows.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
@@ -257,6 +272,8 @@ You can experiment with the **radius** value to achieve the best result for your
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
+#include <limits>
+#include <memory>
 #include <winrt/Windows.UI.Xaml.Automation.h>
 
 using namespace winrt::Windows::UI::Xaml;
@@ -277,12 +294,14 @@ struct {
     int excludeSystemButtonsMode;
     double lerpSpeed;
     bool disableBounce;
+    bool smoothLayoutTransition;
 } g_settings;
 
 
 // Global flags
 std::atomic<bool> g_taskbarViewDllLoaded = false;
 std::atomic<bool> g_hooksApplied = false;
+std::atomic<bool> g_unloading = false;
 
 // Animation Loop Globals
 winrt::event_token g_renderingToken;
@@ -323,11 +342,92 @@ struct HostSignature {
     uint64_t orderHash = 0;
 };
 
+struct FlipItemAnim {
+    winrt::weak_ref<FrameworkElement> element;
+    winrt::weak_ref<FrameworkElement> sysTray;
+    double lastLayoutX = 0.0;
+    double offsetX = 0.0;
+    double velX = 0.0;
+    double offsetY = 0.0;
+    double velY = 0.0;
+    double scale = 1.0;
+    double velScale = 0.0;
+    double enterDelay = 0.0;
+    double fadeElapsed = 0.0;
+    bool isTrayItem = false;
+    bool isEntering = false;
+    bool opacityManaged = false;
+    bool seenThisPass = false;
+    std::chrono::steady_clock::time_point lastJumpTime{};
+};
+
+struct DockWidthAnimator {
+    winrt::weak_ref<FrameworkElement> taskbarFrame;
+    winrt::weak_ref<FrameworkElement> rootGrid;
+    winrt::weak_ref<FrameworkElement> bgControl;
+    winrt::weak_ref<FrameworkElement> bgGrid;
+    winrt::weak_ref<FrameworkElement> repeater;
+
+    int64_t marginCallbackToken = 0;
+    winrt::event_token layoutUpdatedToken{};
+    bool hasLayoutUpdated = false;
+    winrt::event_token renderingToken{};
+    bool isRendering = false;
+
+    bool hasBaseline = false;
+    double layoutWidth = 0.0;
+    double currentWidth = 0.0;
+    double targetWidth = 0.0;
+    double widthVelocity = 0.0;
+    bool pillAnimating = false;
+
+    bool shrinkPending = false;
+    bool shrinkAnimActive = false;
+    double shrinkStartWidth = 0.0;
+    double shrinkStartVelocity = 0.0;
+    double shrinkElapsed = 0.0;
+    double shrinkDuration = 0.42;
+    DispatcherTimer shrinkTimer{nullptr};
+    DispatcherTimer::Tick_revoker shrinkTimerRevoker;
+
+    bool flipBaselineReady = false;
+    std::unordered_map<void*, FlipItemAnim> flipItems;
+
+    std::chrono::steady_clock::time_point lastTick{};
+};
+
+static TransformGroup EnsureIconTransformGroup(FrameworkElement const& element) {
+    if (!element) return nullptr;
+    auto tg = element.RenderTransform().try_as<TransformGroup>();
+    if (tg && tg.Children().Size() >= 6) {
+        return tg;
+    }
+    if (tg && tg.Children().Size() >= 4) {
+        if (tg.Children().Size() == 4) {
+            tg.Children().Append(ScaleTransform());     // 4 flipScale
+        }
+        if (tg.Children().Size() == 5) {
+            tg.Children().Append(TranslateTransform()); // 5 flipTranslate
+        }
+        return tg;
+    }
+    tg = TransformGroup();
+    tg.Children().Append(ScaleTransform());       // 0 waveScale
+    tg.Children().Append(TranslateTransform());   // 1 waveTranslate
+    tg.Children().Append(ScaleTransform());       // 2 bounceScale
+    tg.Children().Append(TranslateTransform());   // 3 bounceTranslate
+    tg.Children().Append(ScaleTransform());       // 4 flipScale
+    tg.Children().Append(TranslateTransform());   // 5 flipTranslate
+    element.RenderTransform(tg);
+    return tg;
+}
+
 struct DockAnimationContext {
     bool isInitialized = false;
     winrt::weak_ref<FrameworkElement> taskbarFrame;
     winrt::weak_ref<FrameworkElement> iconHost;
     std::vector<TaskbarIconInfo> icons;
+    std::shared_ptr<DockWidthAnimator> widthAnim;
 
     HostSignature lastSig;
     std::chrono::steady_clock::time_point lastDirtyCheck{};
@@ -582,8 +682,32 @@ FrameworkElement FindChildByClassNamePartial(FrameworkElement element, PCWSTR pa
     });
 }
 
+static FrameworkElement FindTaskbarRepeater(FrameworkElement const& root, int depth) {
+    if (!root || depth > 4) return nullptr;
+    try {
+        if (depth > 0) {
+            if (root.Name() == L"TaskbarFrameRepeater") {
+                return root;
+            }
+            if (winrt::get_class_name(root) == L"Microsoft.UI.Xaml.Controls.ItemsRepeater") {
+                return root;
+            }
+        }
+        int count = VisualTreeHelper::GetChildrenCount(root);
+        for (int i = 0; i < count; i++) {
+            auto ch = VisualTreeHelper::GetChild(root, i).try_as<FrameworkElement>();
+            if (!ch) continue;
+            if (auto found = FindTaskbarRepeater(ch, depth + 1)) {
+                return found;
+            }
+        }
+    } catch (...) {}
+    return nullptr;
+}
+
 static FrameworkElement FindIconHost(FrameworkElement const& taskbarFrame) {
-    FrameworkElement host = FindChildByClassNamePartial(taskbarFrame, L"TaskbarFrameRepeater");
+    FrameworkElement host = FindTaskbarRepeater(taskbarFrame, 0);
+    if (!host) host = FindChildByClassNamePartial(taskbarFrame, L"TaskbarFrameRepeater");
     if (!host) host = FindChildByClassName(taskbarFrame, L"TaskbarFrameRepeater");
     if (!host) host = FindChildByClassName(taskbarFrame, L"TaskbarItemHost");
     return host;
@@ -652,7 +776,7 @@ static ButtonKind ClassifyButton(FrameworkElement const& e) {
     };
 
     if (has(L"startbutton") || has(L"start")) return ButtonKind::Start;
-    if (has(L"searchbutton") || has(L"search")) return ButtonKind::Search;
+    if (has(L"searchbutton") || has(L"search") || has(L"systemcomposerentrybutton")) return ButtonKind::Search;
     if (has(L"taskviewbutton") || has(L"task view") || has(L"taskview")) return ButtonKind::TaskView;
     if (has(L"widgetsbutton") || has(L"widgets")) return ButtonKind::Widgets;
     if (has(L"weather")) return ButtonKind::Weather;
@@ -727,12 +851,27 @@ static bool RebaseIconGeometryFast(DockAnimationContext& ctx) {
             double w = e.ActualWidth();
             info.elementWidth = w;
 
+            double restPtX = pt.X;
+            if (auto tg = e.RenderTransform().try_as<TransformGroup>()) {
+                if (tg.Children().Size() >= 6) {
+                    if (auto ft = tg.Children().GetAt(5).try_as<TranslateTransform>()) {
+                        restPtX -= ft.X();
+                    }
+                    if (auto fs = tg.Children().GetAt(4).try_as<ScaleTransform>()) {
+                        double sx = fs.ScaleX();
+                        if (std::isfinite(sx) && sx > 0.01 && std::abs(sx - 1.0) > 0.001) {
+                            restPtX -= (1.0 - sx) * w * 0.5;
+                        }
+                    }
+                }
+            }
+
             float yOrigin = g_settings.disableVerticalBounce
                 ? 0.5f
                 : (g_settings.mirrorAnimation ? 0.0f : 1.0f);
 
             if (g_settings.taskbarLabelsMode) {
-                double newStartX = pt.X;
+                double newStartX = restPtX;
                 info.originalCenterX = newStartX;
 
                 float iconCenterPx = 24.0f;
@@ -741,7 +880,7 @@ static bool RebaseIconGeometryFast(DockAnimationContext& ctx) {
 
                 if (std::abs(newStartX - oldX) > 0.5) changed = true;
             } else {
-                double newCenterX = pt.X + (w / 2.0);
+                double newCenterX = restPtX + (w / 2.0);
                 info.originalCenterX = newCenterX;
 
                 e.RenderTransformOrigin({ 0.5f, yOrigin });
@@ -809,6 +948,34 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
             return nullptr;
         };
 
+    std::function<bool(FrameworkElement, int)> SubtreeHasSystemTray =
+        [&](FrameworkElement root, int depth) -> bool {
+            if (!root || depth <= 0) return false;
+            auto cn = winrt::get_class_name(root);
+            if (std::wstring_view(cn).rfind(L"SystemTray.", 0) == 0) return true;
+
+            int c = VisualTreeHelper::GetChildrenCount(root);
+            for (int i = 0; i < c; i++) {
+                auto ch = VisualTreeHelper::GetChild(root, i).try_as<FrameworkElement>();
+                if (ch && SubtreeHasSystemTray(ch, depth - 1)) return true;
+            }
+            return false;
+        };
+
+    std::function<FrameworkElement(FrameworkElement, int)> FindComposerEntryButton =
+        [&](FrameworkElement root, int depth) -> FrameworkElement {
+            if (!root || depth <= 0) return nullptr;
+            if (winrt::get_class_name(root) == L"ComposerTaskbarUX.SystemComposerEntryButton") return root;
+
+            int c = VisualTreeHelper::GetChildrenCount(root);
+            for (int i = 0; i < c; i++) {
+                auto ch = VisualTreeHelper::GetChild(root, i).try_as<FrameworkElement>();
+                if (!ch) continue;
+                if (auto hit = FindComposerEntryButton(ch, depth - 1)) return hit;
+            }
+            return nullptr;
+        };
+
     // classifier node
     std::function<FrameworkElement(FrameworkElement)> FindClassifierNode =
         [&](FrameworkElement root) -> FrameworkElement {
@@ -849,15 +1016,7 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
         try {
             if (!element) return;
 
-            auto tg = element.RenderTransform().try_as<TransformGroup>();
-            if (!tg || tg.Children().Size() < 4) {
-                tg = TransformGroup();
-                tg.Children().Append(ScaleTransform());       // 0 waveScale
-                tg.Children().Append(TranslateTransform());   // 1 waveTranslate
-                tg.Children().Append(ScaleTransform());       // 2 bounceScale
-                tg.Children().Append(TranslateTransform());   // 3 bounceTranslate
-                element.RenderTransform(tg);
-            }
+            auto tg = EnsureIconTransformGroup(element);
 
             float yOrigin = g_settings.disableVerticalBounce
                 ? 0.5f
@@ -870,16 +1029,29 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
             info.element = element;
             info.elementWidth = element.ActualWidth();
 
+            double restPtX = point.X;
+            if (tg && tg.Children().Size() >= 6) {
+                if (auto ft = tg.Children().GetAt(5).try_as<TranslateTransform>()) {
+                    restPtX -= ft.X();
+                }
+                if (auto fs = tg.Children().GetAt(4).try_as<ScaleTransform>()) {
+                    double sx = fs.ScaleX();
+                    if (std::isfinite(sx) && sx > 0.01 && std::abs(sx - 1.0) > 0.001) {
+                        restPtX -= (1.0 - sx) * info.elementWidth * 0.5;
+                    }
+                }
+            }
+
             if (g_settings.taskbarLabelsMode) {
                 float iconCenterPx = 24.0f;
                 float iconCenterProportion =
                     (info.elementWidth > 0) ? (iconCenterPx / (float)info.elementWidth) : 0.5f;
 
                 element.RenderTransformOrigin({ iconCenterProportion, yOrigin });
-                info.originalCenterX = point.X;
+                info.originalCenterX = restPtX;
             } else {
                 element.RenderTransformOrigin({ 0.5f, yOrigin });
-                info.originalCenterX = point.X + (info.elementWidth / 2.0);
+                info.originalCenterX = restPtX + (info.elementWidth / 2.0);
             }
 
             void* key = winrt::get_abi(element);
@@ -973,7 +1145,8 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
     // host selection
     auto host = ctx.iconHost.get();
     if (!host) {
-        host = FindSmartHost();
+        host = FindIconHost(taskbarFrame);
+        if (!host) host = FindSmartHost();
         if (host) ctx.iconHost = host;
     }
 
@@ -985,6 +1158,12 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
                 auto child = VisualTreeHelper::GetChild(host, i).try_as<FrameworkElement>();
                 if (!child) continue;
 
+                if (SubtreeHasSystemTray(child, 6)) {
+                    void* kC = winrt::get_abi(child);
+                    if (prevElements.contains(kC)) ResetElementTransforms(child);
+                    continue;
+                }
+
                 FrameworkElement classifier = FindClassifierNode(child);
                 FrameworkElement base = classifier ? classifier : child;
 
@@ -992,8 +1171,9 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
                     ? true
                     : ShouldAnimateElement(base);
 
-                // target: prefer TaskListButton inside, else child
+                // target: prefer TaskListButton inside, else SystemComposerEntryButton, else child
                 FrameworkElement target = FindFirstTaskListButton(child);
+                if (!target) target = FindComposerEntryButton(child, 10);
                 if (!target) target = child;
 
                 if (!animate) {
@@ -1013,6 +1193,9 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
             // FALLBACK: recurse and include TaskListButtonPanel too
             std::function<void(FrameworkElement)> recurse = [&](FrameworkElement element) {
                 if (!element) return;
+                if (std::wstring_view(winrt::get_class_name(element)).rfind(L"SystemTray.", 0) == 0) {
+                    return;
+                }
 
                 if (IsFallbackCandidate(element)) {
                     FrameworkElement classifier = FindClassifierNode(element);
@@ -1023,6 +1206,7 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
                         : ShouldAnimateElement(base);
 
                     FrameworkElement target = FindFirstTaskListButton(element);
+                    if (!target) target = FindComposerEntryButton(element, 10);
                     if (!target) target = element;
 
                     if (!animate) {
@@ -1055,11 +1239,835 @@ void RefreshIconPositions(DockAnimationContext& ctx) {
     }
 }
 
+static void StepCriticalSpring(double& x, double& v, double target, double omega, double dt) {
+    double disp = x - target;
+    double expTerm = std::exp(-omega * dt);
+    double newDisp = (disp + (v + omega * disp) * dt) * expTerm;
+    double newV = (v - omega * (v + omega * disp) * dt) * expTerm;
+    x = target + newDisp;
+    v = newV;
+}
+
+constexpr int kDefaultCollapseDelayMs = 900;
+constexpr double kDefaultCollapseDurationSec = 0.42;
+
+static void StepDampedSpring(double& x, double& v, double target,
+                             double omega, double zeta, double dt) {
+    if (zeta >= 0.999) {
+        StepCriticalSpring(x, v, target, omega, dt);
+        return;
+    }
+    double disp = x - target;
+    double wd = omega * std::sqrt(1.0 - zeta * zeta);
+    double decay = std::exp(-zeta * omega * dt);
+    double cosT = std::cos(wd * dt);
+    double sinT = std::sin(wd * dt);
+    double A = disp;
+    double B = (v + zeta * omega * disp) / wd;
+    x = target + decay * (A * cosT + B * sinT);
+    v = decay * ((B * wd - A * zeta * omega) * cosT -
+                 (A * wd + B * zeta * omega) * sinT);
+}
+
+static void ClearManagedOpacity(FrameworkElement const& el, FlipItemAnim& item) {
+    if (!item.opacityManaged) return;
+    item.opacityManaged = false;
+    if (!el) return;
+    try {
+        el.ClearValue(UIElement::OpacityProperty());
+    } catch (...) {
+        try { el.Opacity(1.0); } catch (...) {}
+    }
+}
+
+static void ClearBgGridTransforms(FrameworkElement const& bgGrid) {
+    if (!bgGrid) return;
+    try {
+        auto rt = bgGrid.RenderTransform();
+        if (rt && (rt.try_as<ScaleTransform>() || rt.try_as<TransformGroup>())) {
+            bgGrid.ClearValue(UIElement::RenderTransformProperty());
+            bgGrid.ClearValue(UIElement::RenderTransformOriginProperty());
+        }
+    } catch (...) {}
+}
+
+static double GetChildLayoutX(FrameworkElement const& child,
+                              FrameworkElement const& sysTray) {
+    double lx = 0.0;
+    try {
+        auto off = child.ActualOffset();
+        if (std::isfinite(off.x)) {
+            lx = static_cast<double>(off.x);
+        }
+    } catch (...) {}
+    if (sysTray) {
+        try {
+            double tmL = sysTray.Margin().Left;
+            if (std::isfinite(tmL)) lx += tmL;
+        } catch (...) {}
+    }
+    return lx;
+}
+
+static void ApplyFlipTransform(FrameworkElement const& el,
+                               double offsetX,
+                               double offsetY,
+                               double scale,
+                               bool allowScale) {
+    if (!el) return;
+    try {
+        auto tg = EnsureIconTransformGroup(el);
+        if (!tg || tg.Children().Size() < 6) return;
+        if (auto flipScale = tg.Children().GetAt(4).try_as<ScaleTransform>()) {
+            if (allowScale) {
+                flipScale.ScaleX(scale);
+                flipScale.ScaleY(scale);
+            }
+        }
+        if (auto flipTranslate = tg.Children().GetAt(5).try_as<TranslateTransform>()) {
+            flipTranslate.X(offsetX);
+            flipTranslate.Y(allowScale ? offsetY : 0.0);
+        }
+    } catch (...) {}
+}
+
+static FrameworkElement FindDescendantSystemTrayFrame(FrameworkElement const& root, int depth) {
+    if (!root || depth > 4) return nullptr;
+    try {
+        if (winrt::get_class_name(root) == L"SystemTray.SystemTrayFrame") {
+            return root;
+        }
+        int count = VisualTreeHelper::GetChildrenCount(root);
+        for (int i = 0; i < count; i++) {
+            auto ch = VisualTreeHelper::GetChild(root, i).try_as<FrameworkElement>();
+            if (!ch) continue;
+            if (auto found = FindDescendantSystemTrayFrame(ch, depth + 1)) {
+                return found;
+            }
+        }
+    } catch (...) {}
+    return nullptr;
+}
+
+static bool IsTaskListButtonClass(FrameworkElement const& e) {
+    if (!e) return false;
+    try {
+        return winrt::get_class_name(e) == L"Taskbar.TaskListButton";
+    } catch (...) {
+        return false;
+    }
+}
+
+static void CancelPendingShrink(DockWidthAnimator& a) {
+    a.shrinkPending = false;
+    if (a.shrinkTimer) {
+        try { a.shrinkTimer.Stop(); } catch (...) {}
+    }
+}
+
+static void StartShrinkEase(DockWidthAnimator& a, double destWidth) {
+    a.targetWidth = destWidth;
+    a.shrinkStartWidth = a.currentWidth;
+    a.shrinkStartVelocity = a.widthVelocity;
+    a.shrinkElapsed = 0.0;
+    double dist = std::abs(a.currentWidth - destWidth);
+    double baseDur = kDefaultCollapseDurationSec;
+    a.shrinkDuration = std::clamp(
+        baseDur * std::clamp(std::sqrt(std::max(dist, 1.0) / 56.0), 0.78, 1.15),
+        0.18, 1.50);
+    a.shrinkAnimActive = true;
+    a.pillAnimating = true;
+}
+
+static void ArmPendingShrink(std::shared_ptr<DockWidthAnimator> const& a);
+
+static void StartDockAnimatorLoop(std::shared_ptr<DockWidthAnimator> const& a) {
+    if (!a || a->isRendering || g_unloading.load()) return;
+    a->lastTick = std::chrono::steady_clock::now();
+    a->isRendering = true;
+    std::weak_ptr<DockWidthAnimator> weakAnim = a;
+    a->renderingToken = Media::CompositionTarget::Rendering(
+        [weakAnim](winrt::Windows::Foundation::IInspectable const&,
+                   winrt::Windows::Foundation::IInspectable const&) {
+            auto sa = weakAnim.lock();
+            if (!sa) return;
+            if (g_unloading.load()) {
+                if (sa->isRendering) {
+                    try { Media::CompositionTarget::Rendering(sa->renderingToken); } catch (...) {}
+                    sa->isRendering = false;
+                }
+                return;
+            }
+            auto ctrl = sa->bgControl.get();
+            auto grid = sa->bgGrid.get();
+            if (!ctrl || !grid) {
+                if (sa->isRendering) {
+                    try { Media::CompositionTarget::Rendering(sa->renderingToken); } catch (...) {}
+                    sa->isRendering = false;
+                }
+                return;
+            }
+
+            try {
+                auto now = std::chrono::steady_clock::now();
+                double dt = std::chrono::duration<double>(now - sa->lastTick).count();
+                sa->lastTick = now;
+                dt = std::clamp(dt, 0.001, 0.025);
+
+                constexpr double kOmegaMove = 13.5;
+                constexpr double kOmegaCloseSlide = 9.2;
+                constexpr double kOmegaEnterScale = 12.0;
+                constexpr double kZetaEnterScale = 0.82;
+                constexpr double kOmegaEnterY = 11.5;
+                constexpr double kZetaEnterY = 0.86;
+                constexpr double kEnterFadeDuration = 0.16;
+
+                if (sa->pillAnimating) {
+                    if (sa->shrinkAnimActive) {
+                        sa->shrinkElapsed += dt;
+                        double T = std::max(sa->shrinkDuration, 0.05);
+                        double u = std::clamp(sa->shrinkElapsed / T, 0.0, 1.0);
+                        double p0 = sa->shrinkStartWidth;
+                        double p1 = sa->targetWidth;
+                        if (std::abs(sa->shrinkStartVelocity) < 1.0) {
+                            double s = u * u * u * (u * (6.0 * u - 15.0) + 10.0);
+                            double ds = 30.0 * u * u * (1.0 - u) * (1.0 - u);
+                            sa->currentWidth = p0 + (p1 - p0) * s;
+                            sa->widthVelocity = (p1 - p0) * ds / T;
+                        } else {
+                            double maxSpan = std::abs(p1 - p0);
+                            double m0 = std::clamp(sa->shrinkStartVelocity * T, -2.0 * maxSpan, 2.0 * maxSpan);
+                            double u2 = u * u;
+                            double u3 = u2 * u;
+                            double h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
+                            double h10 = u3 - 2.0 * u2 + u;
+                            double h01 = -2.0 * u3 + 3.0 * u2;
+                            sa->currentWidth = h00 * p0 + h10 * m0 + h01 * p1;
+                            double dh00 = 6.0 * u2 - 6.0 * u;
+                            double dh10 = 3.0 * u2 - 4.0 * u + 1.0;
+                            double dh01 = -6.0 * u2 + 6.0 * u;
+                            sa->widthVelocity = (dh00 * p0 + dh10 * m0 + dh01 * p1) / T;
+                        }
+                        if (u >= 1.0 - 1e-4) {
+                            sa->currentWidth = p1;
+                            sa->widthVelocity = 0.0;
+                            sa->shrinkAnimActive = false;
+                            sa->pillAnimating = false;
+                        }
+                    } else {
+                        StepCriticalSpring(sa->currentWidth, sa->widthVelocity, sa->targetWidth, kOmegaMove, dt);
+                        if (std::abs(sa->currentWidth - sa->targetWidth) < 0.12 &&
+                            std::abs(sa->widthVelocity) < 0.8) {
+                            sa->currentWidth = sa->targetWidth;
+                            sa->widthVelocity = 0.0;
+                            sa->pillAnimating = false;
+                        }
+                    }
+
+                    if (!sa->pillAnimating && !sa->shrinkPending &&
+                        std::abs(sa->layoutWidth - sa->currentWidth) < 0.5) {
+                        try { ctrl.Margin(Thickness{0, 0, 0, 0}); } catch (...) {}
+                    } else {
+                        double delta = std::clamp((sa->layoutWidth - sa->currentWidth) * 0.5, -350.0, 350.0);
+                        try { ctrl.Margin(Thickness{delta, 0, delta, 0}); } catch (...) {}
+                    }
+
+                    if (!sa->pillAnimating && !sa->shrinkPending &&
+                        sa->layoutWidth < sa->currentWidth - 0.5) {
+                        ArmPendingShrink(sa);
+                    }
+                }
+
+                bool anyEnteringOrExpanding =
+                    (sa->pillAnimating && !sa->shrinkAnimActive &&
+                     sa->targetWidth > sa->currentWidth + 0.5);
+                if (!anyEnteringOrExpanding) {
+                    for (auto const& kv : sa->flipItems) {
+                        if (!kv.second.isTrayItem &&
+                            (kv.second.isEntering || kv.second.enterDelay > 0.0)) {
+                            anyEnteringOrExpanding = true;
+                            break;
+                        }
+                    }
+                }
+                double slideOmega = anyEnteringOrExpanding ? kOmegaMove : kOmegaCloseSlide;
+
+                bool anyFlipActive = false;
+                for (auto it = sa->flipItems.begin(); it != sa->flipItems.end(); ) {
+                    auto el = it->second.element.get();
+                    if (!el) {
+                        it = sa->flipItems.erase(it);
+                        continue;
+                    }
+                    auto& item = it->second;
+                    bool wasActive =
+                        (item.offsetX != 0.0 || item.velX != 0.0 ||
+                         (!item.isTrayItem && (item.isEntering || item.enterDelay > 0.0 ||
+                                               item.opacityManaged ||
+                                               item.offsetY != 0.0 || item.velY != 0.0 ||
+                                               item.scale != 1.0 || item.velScale != 0.0)));
+
+                    if (wasActive) {
+                        if (std::abs(item.offsetX) >= 0.10 || std::abs(item.velX) >= 0.6) {
+                            StepCriticalSpring(item.offsetX, item.velX, 0.0, slideOmega, dt);
+                            if (std::abs(item.offsetX) < 0.10 && std::abs(item.velX) < 0.6) {
+                                item.offsetX = 0.0;
+                                item.velX = 0.0;
+                            }
+                        } else {
+                            item.offsetX = 0.0;
+                            item.velX = 0.0;
+                        }
+
+                        if (!item.isTrayItem &&
+                            (item.isEntering || item.enterDelay > 0.0 || item.opacityManaged ||
+                             item.offsetY != 0.0 || item.velY != 0.0 ||
+                             item.scale != 1.0 || item.velScale != 0.0)) {
+                            if (item.enterDelay > 0.0) {
+                                item.enterDelay = std::max(0.0, item.enterDelay - dt);
+                                if (item.opacityManaged) {
+                                    try { el.Opacity(0.0); } catch (...) {}
+                                }
+                            } else {
+                                if (item.opacityManaged) {
+                                    item.fadeElapsed += dt;
+                                    double u = std::clamp(item.fadeElapsed / kEnterFadeDuration, 0.0, 1.0);
+                                    if (u >= 0.999) {
+                                        ClearManagedOpacity(el, item);
+                                    } else {
+                                        double inv = 1.0 - u;
+                                        double op = 1.0 - inv * inv * inv;
+                                        try { el.Opacity(op); } catch (...) {}
+                                    }
+                                }
+
+                                if (std::abs(item.offsetY) >= 0.08 || std::abs(item.velY) >= 0.5) {
+                                    StepDampedSpring(item.offsetY, item.velY, 0.0, kOmegaEnterY, kZetaEnterY, dt);
+                                    if (std::abs(item.offsetY) < 0.08 && std::abs(item.velY) < 0.5) {
+                                        item.offsetY = 0.0;
+                                        item.velY = 0.0;
+                                    }
+                                } else {
+                                    item.offsetY = 0.0;
+                                    item.velY = 0.0;
+                                }
+
+                                if (std::abs(item.scale - 1.0) >= 0.002 || std::abs(item.velScale) >= 0.03) {
+                                    StepDampedSpring(item.scale, item.velScale, 1.0, kOmegaEnterScale, kZetaEnterScale, dt);
+                                    if (std::abs(item.scale - 1.0) < 0.002 && std::abs(item.velScale) < 0.03) {
+                                        item.scale = 1.0;
+                                        item.velScale = 0.0;
+                                    }
+                                } else {
+                                    item.scale = 1.0;
+                                    item.velScale = 0.0;
+                                }
+
+                                if (!item.opacityManaged &&
+                                    item.offsetY == 0.0 && item.velY == 0.0 &&
+                                    item.scale == 1.0 && item.velScale == 0.0) {
+                                    item.isEntering = false;
+                                }
+                            }
+                        }
+
+                        ApplyFlipTransform(el, item.offsetX, item.offsetY, item.scale, !item.isTrayItem);
+
+                        if (item.offsetX != 0.0 || item.velX != 0.0 ||
+                            (!item.isTrayItem && (item.isEntering || item.enterDelay > 0.0 ||
+                                                  item.opacityManaged ||
+                                                  item.offsetY != 0.0 || item.velY != 0.0 ||
+                                                  item.scale != 1.0 || item.velScale != 0.0))) {
+                            anyFlipActive = true;
+                        }
+                    }
+                    ++it;
+                }
+
+                if (!sa->pillAnimating && !anyFlipActive) {
+                    try { Media::CompositionTarget::Rendering(sa->renderingToken); } catch (...) {}
+                    sa->isRendering = false;
+                }
+            } catch (...) {}
+        });
+}
+
+static void ArmPendingShrink(std::shared_ptr<DockWidthAnimator> const& a) {
+    if (!a || g_unloading.load()) return;
+    int delayMs = kDefaultCollapseDelayMs;
+    if (delayMs <= 0) {
+        CancelPendingShrink(*a);
+        StartShrinkEase(*a, a->layoutWidth);
+        StartDockAnimatorLoop(a);
+        return;
+    }
+
+    a->shrinkPending = true;
+    if (!a->shrinkTimer) {
+        a->shrinkTimer = DispatcherTimer();
+        std::weak_ptr<DockWidthAnimator> weakAnim = a;
+        a->shrinkTimerRevoker = a->shrinkTimer.Tick(
+            winrt::auto_revoke,
+            [weakAnim](winrt::Windows::Foundation::IInspectable const&,
+                       winrt::Windows::Foundation::IInspectable const&) {
+                if (g_unloading.load()) return;
+                auto sa = weakAnim.lock();
+                if (!sa) return;
+                if (sa->shrinkTimer) {
+                    try { sa->shrinkTimer.Stop(); } catch (...) {}
+                }
+                if (!sa->shrinkPending) return;
+                sa->shrinkPending = false;
+                if (sa->layoutWidth < sa->currentWidth - 0.5) {
+                    StartShrinkEase(*sa, sa->layoutWidth);
+                    StartDockAnimatorLoop(sa);
+                } else {
+                    sa->targetWidth = sa->layoutWidth;
+                    if (auto ctrl = sa->bgControl.get()) {
+                        double d = std::clamp((sa->layoutWidth - sa->currentWidth) * 0.5, -350.0, 350.0);
+                        try { ctrl.Margin(Thickness{d, 0, d, 0}); } catch (...) {}
+                    }
+                }
+            });
+    } else {
+        try { a->shrinkTimer.Stop(); } catch (...) {}
+    }
+    a->shrinkTimer.Interval(std::chrono::milliseconds{delayMs});
+    a->shrinkTimer.Start();
+}
+
+void DetachDockWidthAnimator(DockAnimationContext& ctx) {
+    if (!ctx.widthAnim) return;
+    auto& a = *ctx.widthAnim;
+    a.shrinkPending = false;
+    a.shrinkAnimActive = false;
+    a.shrinkTimerRevoker.revoke();
+    if (a.shrinkTimer) {
+        try { a.shrinkTimer.Stop(); } catch (...) {}
+        a.shrinkTimer = nullptr;
+    }
+    if (a.isRendering) {
+        try {
+            Media::CompositionTarget::Rendering(a.renderingToken);
+        } catch (...) {}
+        a.isRendering = false;
+    }
+    if (a.hasLayoutUpdated) {
+        if (auto tf = a.taskbarFrame.get()) {
+            try {
+                tf.LayoutUpdated(a.layoutUpdatedToken);
+            } catch (...) {}
+        }
+        a.hasLayoutUpdated = false;
+    }
+    if (a.marginCallbackToken != 0) {
+        if (auto g = a.bgGrid.get()) {
+            try {
+                g.UnregisterPropertyChangedCallback(
+                    FrameworkElement::MarginProperty(), a.marginCallbackToken);
+            } catch (...) {}
+        }
+        a.marginCallbackToken = 0;
+    }
+    if (auto ctrl = a.bgControl.get()) {
+        try {
+            ctrl.Margin(Thickness{0, 0, 0, 0});
+        } catch (...) {}
+    }
+    if (auto g = a.bgGrid.get()) {
+        ClearBgGridTransforms(g);
+    }
+    for (auto& kv : a.flipItems) {
+        if (auto el = kv.second.element.get()) {
+            ClearManagedOpacity(el, kv.second);
+            ApplyFlipTransform(el, 0.0, 0.0, 1.0, !kv.second.isTrayItem);
+        }
+    }
+    a.flipItems.clear();
+    ctx.widthAnim.reset();
+}
+
+void AttachDockWidthAnimator(DockAnimationContext& ctx,
+                             FrameworkElement const& taskbarFrame) {
+    if (ctx.widthAnim) {
+        DetachDockWidthAnimator(ctx);
+    }
+
+    std::function<FrameworkElement(FrameworkElement const&, int)> findBgControl =
+        [&](FrameworkElement const& el, int depth) -> FrameworkElement {
+            if (!el || depth > 4) return nullptr;
+            if (depth > 0) {
+                try {
+                    if (winrt::get_class_name(el) == L"Taskbar.TaskbarBackground" &&
+                        el.Name() != L"HoverFlyoutBackgroundControl") {
+                        return el;
+                    }
+                } catch (...) {}
+            }
+            int count = VisualTreeHelper::GetChildrenCount(el);
+            for (int i = 0; i < count; i++) {
+                auto ch = VisualTreeHelper::GetChild(el, i).try_as<FrameworkElement>();
+                if (!ch) continue;
+                if (auto found = findBgControl(ch, depth + 1)) {
+                    return found;
+                }
+            }
+            return nullptr;
+        };
+
+    FrameworkElement bgCtrl = findBgControl(taskbarFrame, 0);
+    if (!bgCtrl) {
+        return;
+    }
+    FrameworkElement rootGrid = VisualTreeHelper::GetParent(bgCtrl).try_as<FrameworkElement>();
+    FrameworkElement bgGrid = FindChildByClassName(bgCtrl, L"Windows.UI.Xaml.Controls.Grid");
+    if (!rootGrid || !bgGrid) {
+        return;
+    }
+
+    auto anim = std::make_shared<DockWidthAnimator>();
+    anim->taskbarFrame = taskbarFrame;
+    anim->rootGrid = rootGrid;
+    anim->bgControl = bgCtrl;
+    anim->bgGrid = bgGrid;
+
+    FrameworkElement repeater = FindTaskbarRepeater(rootGrid, 0);
+    if (!repeater) {
+        repeater = FindTaskbarRepeater(taskbarFrame, 0);
+    }
+    anim->repeater = repeater;
+
+    ClearBgGridTransforms(bgGrid);
+    try { bgCtrl.Margin(Thickness{0, 0, 0, 0}); } catch (...) {}
+
+    double rootW = static_cast<double>(rootGrid.ActualWidth());
+    if (rootW >= 200.0) {
+        auto m = bgGrid.Margin();
+        double initW = rootW - m.Left - m.Right;
+        if (initW >= 100.0 && initW <= rootW) {
+            anim->layoutWidth = initW;
+            anim->currentWidth = initW;
+            anim->targetWidth = initW;
+            anim->hasBaseline = true;
+        }
+    }
+
+    std::weak_ptr<DockWidthAnimator> weakAnim = anim;
+    anim->marginCallbackToken = bgGrid.RegisterPropertyChangedCallback(
+        FrameworkElement::MarginProperty(),
+        [weakAnim](DependencyObject const&, DependencyProperty const&) {
+            if (g_unloading.load()) return;
+            auto a = weakAnim.lock();
+            if (!a) return;
+            try {
+                auto root = a->rootGrid.get();
+                auto bgC = a->bgControl.get();
+                auto grid = a->bgGrid.get();
+                if (!root || !bgC || !grid) return;
+
+                double rW = static_cast<double>(root.ActualWidth());
+                auto m = grid.Margin();
+                double newTarget = rW - m.Left - m.Right;
+                if (rW < 200.0 || !std::isfinite(newTarget) ||
+                    newTarget < 100.0 || newTarget > rW) {
+                    return;
+                }
+
+                if (!a->hasBaseline) {
+                    a->layoutWidth = newTarget;
+                    a->currentWidth = newTarget;
+                    a->targetWidth = newTarget;
+                    a->widthVelocity = 0.0;
+                    a->hasBaseline = true;
+                    return;
+                }
+
+                if (std::abs(newTarget - a->layoutWidth) < 0.5) {
+                    a->layoutWidth = newTarget;
+                    return;
+                }
+
+                if (std::abs(newTarget - a->currentWidth) > 650.0) {
+                    CancelPendingShrink(*a);
+                    a->shrinkAnimActive = false;
+                    a->layoutWidth = newTarget;
+                    a->currentWidth = newTarget;
+                    a->targetWidth = newTarget;
+                    a->widthVelocity = 0.0;
+                    a->pillAnimating = false;
+                    bgC.Margin(Thickness{0, 0, 0, 0});
+                    return;
+                }
+
+                a->layoutWidth = newTarget;
+                double sideDelta = std::clamp((a->layoutWidth - a->currentWidth) * 0.5, -350.0, 350.0);
+                bgC.Margin(Thickness{sideDelta, 0, sideDelta, 0});
+
+                if (newTarget >= a->currentWidth - 0.5) {
+                    CancelPendingShrink(*a);
+                    a->shrinkAnimActive = false;
+                    a->targetWidth = newTarget;
+                    if (std::abs(newTarget - a->currentWidth) >= 0.5 || std::abs(a->widthVelocity) >= 0.8) {
+                        a->pillAnimating = true;
+                        StartDockAnimatorLoop(a);
+                    } else {
+                        a->currentWidth = newTarget;
+                        a->widthVelocity = 0.0;
+                        a->pillAnimating = false;
+                        bgC.Margin(Thickness{0, 0, 0, 0});
+                    }
+                } else if (a->shrinkAnimActive && newTarget > a->targetWidth + 0.5) {
+                    CancelPendingShrink(*a);
+                    StartShrinkEase(*a, newTarget);
+                    StartDockAnimatorLoop(a);
+                } else {
+                    if (!a->pillAnimating) {
+                        a->targetWidth = a->currentWidth;
+                        a->widthVelocity = 0.0;
+                    }
+                    ArmPendingShrink(a);
+                }
+            } catch (...) {}
+        });
+
+    anim->layoutUpdatedToken = taskbarFrame.LayoutUpdated(
+        [weakAnim](winrt::Windows::Foundation::IInspectable const&,
+                   winrt::Windows::Foundation::IInspectable const&) {
+            if (g_unloading.load()) return;
+            auto a = weakAnim.lock();
+            if (!a) return;
+            try {
+                auto frame = a->taskbarFrame.get();
+                auto root = a->rootGrid.get();
+                if (!frame || !root || root.ActualWidth() < 200.0) return;
+
+                auto rep = a->repeater.get();
+                if (!rep) {
+                    rep = FindTaskbarRepeater(root, 0);
+                    if (!rep) rep = FindTaskbarRepeater(frame, 0);
+                    if (!rep) return;
+                    a->repeater = rep;
+                }
+
+                int count = VisualTreeHelper::GetChildrenCount(rep);
+                if (count <= 0) return;
+
+                for (auto& kv : a->flipItems) {
+                    kv.second.seenThisPass = false;
+                }
+
+                struct VisibleChildSnapshot {
+                    FrameworkElement child;
+                    void* key;
+                    FrameworkElement sysTray;
+                    bool isTray;
+                    double lx;
+                };
+
+                std::vector<VisibleChildSnapshot> visibleChildren;
+                visibleChildren.reserve(static_cast<size_t>(count));
+
+                bool needRender = false;
+                bool anyVisible = false;
+                auto now = std::chrono::steady_clock::now();
+
+                for (int i = 0; i < count; i++) {
+                    auto child = VisualTreeHelper::GetChild(rep, i).try_as<FrameworkElement>();
+                    if (!child) continue;
+                    if (child.Visibility() != Visibility::Visible || child.ActualWidth() < 1.0) {
+                        continue;
+                    }
+                    anyVisible = true;
+                    void* key = winrt::get_abi(child);
+
+                    FrameworkElement sysTray = nullptr;
+                    bool isTray = false;
+                    auto it = a->flipItems.find(key);
+                    if (it != a->flipItems.end()) {
+                        isTray = it->second.isTrayItem;
+                        sysTray = it->second.sysTray.get();
+                        if (isTray && !sysTray) {
+                            sysTray = FindDescendantSystemTrayFrame(child, 4);
+                            if (sysTray) it->second.sysTray = sysTray;
+                        }
+                    } else if (winrt::get_class_name(child) == L"Taskbar.TaskbarExtensionElement") {
+                        sysTray = FindDescendantSystemTrayFrame(child, 4);
+                        isTray = (sysTray != nullptr);
+                    }
+
+                    double lx = GetChildLayoutX(child, sysTray);
+                    visibleChildren.push_back({std::move(child), key, std::move(sysTray), isTray, lx});
+                }
+
+                std::vector<std::pair<void*, double>> recenterDelayed;
+                std::vector<VisibleChildSnapshot*> newChildren;
+                std::vector<std::pair<double, double>> anchorOffsets;
+                anchorOffsets.reserve(visibleChildren.size());
+
+                // Pass A: update existing tracked items and absorb two-pass layout shifts.
+                for (auto& snap : visibleChildren) {
+                    auto it = a->flipItems.find(snap.key);
+                    if (it == a->flipItems.end()) {
+                        newChildren.push_back(&snap);
+                        continue;
+                    }
+
+                    auto& item = it->second;
+                    item.seenThisPass = true;
+                    double dx = item.lastLayoutX - snap.lx;
+
+                    if (!item.isTrayItem && item.enterDelay > 0.0) {
+                        if (std::isfinite(dx) && std::abs(dx) >= 0.5) {
+                            item.lastLayoutX = snap.lx;
+                            recenterDelayed.push_back({snap.key, snap.lx});
+                        }
+                    } else if (std::isfinite(dx) && std::abs(dx) >= 0.5) {
+                        if (std::abs(dx) <= 450.0) {
+                            double prevOffset = item.offsetX;
+                            double nextOffset = std::clamp(prevOffset + dx, -450.0, 450.0);
+                            if ((prevOffset > 0.5 && dx < -0.5) || (prevOffset < -0.5 && dx > 0.5)) {
+                                bool recentJump =
+                                    (item.lastJumpTime != std::chrono::steady_clock::time_point{}) &&
+                                    (std::chrono::duration<double, std::milli>(now - item.lastJumpTime).count() < 50.0);
+                                if ((prevOffset * nextOffset <= 0.0) ||
+                                    std::abs(nextOffset) < 1.5 ||
+                                    recentJump) {
+                                    item.velX = 0.0;
+                                    if (std::abs(nextOffset) < 1.0) {
+                                        nextOffset = 0.0;
+                                    }
+                                }
+                            }
+                            item.offsetX = nextOffset;
+                            item.lastJumpTime = now;
+                            ApplyFlipTransform(snap.child, item.offsetX, item.offsetY, item.scale, !item.isTrayItem);
+                            if (item.offsetX != 0.0 || item.velX != 0.0) {
+                                needRender = true;
+                            }
+                        } else {
+                            item.offsetX = 0.0;
+                            item.velX = 0.0;
+                            ApplyFlipTransform(snap.child, 0.0, item.offsetY, item.scale, !item.isTrayItem);
+                        }
+                        item.lastLayoutX = snap.lx;
+                    }
+
+                    if (!item.isEntering && item.enterDelay <= 0.0) {
+                        anchorOffsets.push_back({item.lastLayoutX, item.offsetX});
+                    }
+                }
+
+                std::sort(anchorOffsets.begin(), anchorOffsets.end(),
+                    [](auto const& lhs, auto const& rhs) {
+                        return lhs.first < rhs.first;
+                    });
+
+                auto computeSeamOffset = [&](double targetLx) -> double {
+                    bool hasLeft = false;
+                    bool hasRight = false;
+                    double leftOff = 0.0;
+                    double rightOff = 0.0;
+                    for (auto const& anc : anchorOffsets) {
+                        if (anc.first < targetLx - 0.5) {
+                            hasLeft = true;
+                            leftOff = anc.second;
+                        } else if (anc.first > targetLx + 0.5) {
+                            hasRight = true;
+                            rightOff = anc.second;
+                            break;
+                        }
+                    }
+                    double seedX = 0.0;
+                    if (hasLeft && hasRight) {
+                        seedX = (leftOff + rightOff) * 0.5;
+                    } else if (hasLeft) {
+                        seedX = leftOff * 0.5;
+                    } else if (hasRight) {
+                        seedX = rightOff * 0.5;
+                    }
+                    return std::clamp(seedX, -48.0, 48.0);
+                };
+
+                // Pass B: re-center delayed hidden entrants and initialize new icons.
+                for (auto const& delayed : recenterDelayed) {
+                    auto it = a->flipItems.find(delayed.first);
+                    if (it != a->flipItems.end()) {
+                        auto& item = it->second;
+                        if (auto el = item.element.get()) {
+                            item.offsetX = computeSeamOffset(delayed.second);
+                            item.velX = 0.0;
+                            ApplyFlipTransform(el, item.offsetX, item.offsetY, item.scale, !item.isTrayItem);
+                            needRender = true;
+                        }
+                    }
+                }
+
+                for (auto* snapPtr : newChildren) {
+                    auto& snap = *snapPtr;
+                    FlipItemAnim item;
+                    item.element = snap.child;
+                    item.sysTray = snap.sysTray;
+                    item.lastLayoutX = snap.lx;
+                    item.isTrayItem = snap.isTray;
+                    item.seenThisPass = true;
+
+                    if (a->flipBaselineReady && !snap.isTray && IsTaskListButtonClass(snap.child)) {
+                        float yOrigin = g_settings.disableVerticalBounce
+                            ? 0.5f
+                            : (g_settings.mirrorAnimation ? 0.0f : 1.0f);
+                        snap.child.RenderTransformOrigin({ 0.5f, yOrigin });
+                        item.offsetX = computeSeamOffset(snap.lx);
+                        item.velX = 0.0;
+                        item.scale = 0.22;
+                        item.velScale = 0.0;
+                        item.offsetY = g_settings.mirrorAnimation ? -14.0 : 14.0;
+                        item.velY = 0.0;
+                        item.enterDelay = 0.065;
+                        item.fadeElapsed = 0.0;
+                        item.isEntering = true;
+                        item.opacityManaged = true;
+                        try { snap.child.Opacity(0.0); } catch (...) {}
+                        ApplyFlipTransform(snap.child, item.offsetX, item.offsetY, item.scale, true);
+                        needRender = true;
+                    }
+
+                    a->flipItems.emplace(snap.key, std::move(item));
+                }
+
+                if (anyVisible) {
+                    a->flipBaselineReady = true;
+                }
+
+                for (auto it = a->flipItems.begin(); it != a->flipItems.end(); ) {
+                    if (!it->second.seenThisPass) {
+                        if (auto el = it->second.element.get()) {
+                            ClearManagedOpacity(el, it->second);
+                            ApplyFlipTransform(el, 0.0, 0.0, 1.0, !it->second.isTrayItem);
+                        }
+                        it = a->flipItems.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                if (needRender) {
+                    StartDockAnimatorLoop(a);
+                }
+            } catch (...) {}
+        });
+    anim->hasLayoutUpdated = true;
+
+    ctx.widthAnim = std::move(anim);
+}
+
 void InitializeAnimationHooks(void* pThis, FrameworkElement const& taskbarFrame) {
     try {
         DockAnimationContext ctx;
         ctx.taskbarFrame = taskbarFrame;
         ctx.isInitialized = false;
+        if (g_settings.smoothLayoutTransition) {
+            AttachDockWidthAnimator(ctx, taskbarFrame);
+        }
         g_contexts[pThis] = std::move(ctx);
         Wh_Log(L"DockAnimation: Monitor %p registered (hook-based).", pThis);
     }
@@ -1221,13 +2229,19 @@ int WINAPI TaskbarFrame_OnPointerMoved_Hook(void* pThis, void* pArgs) {
     ((IUnknown*)pArgs)->QueryInterface(winrt::guid_of<Input::PointerRoutedEventArgs>(), winrt::put_abi(args));
     if (!args)
         return original();
+    if (g_unloading.load())
+        return original();
+    void* ctxKey = winrt::get_abi(element);
     // Initialize animation hooks only once
-    if (g_contexts.find(pThis) == g_contexts.end()) {
-        InitializeAnimationHooks(pThis, element);
+    auto it = g_contexts.find(ctxKey);
+    if (it == g_contexts.end()) {
+        InitializeAnimationHooks(ctxKey, element);
         Wh_Log(L"DockAnimation: Initialized via OnPointerMoved (%s)", className.c_str());
+    } else if (g_settings.smoothLayoutTransition && !it->second.widthAnim) {
+        AttachDockWidthAnimator(it->second, element);
     }
     // Forward event to existing logic
-    OnTaskbarPointerMoved(pThis, args);
+    OnTaskbarPointerMoved(ctxKey, args);
     return original();
 }
 
@@ -1245,8 +2259,39 @@ int WINAPI TaskbarFrame_OnPointerExited_Hook(void* pThis, void* pArgs) {
     auto className = winrt::get_class_name(element);
     if (className != L"Taskbar.TaskbarFrame")
         return original();
-    OnTaskbarPointerExited(pThis);
+    if (g_unloading.load())
+        return original();
+    void* ctxKey = winrt::get_abi(element);
+    OnTaskbarPointerExited(ctxKey);
     return original();
+}
+
+using TaskbarFrame_MeasureOverride_t =
+    int(WINAPI*)(void* pThis,
+                 winrt::Windows::Foundation::Size size,
+                 winrt::Windows::Foundation::Size* resultSize);
+TaskbarFrame_MeasureOverride_t TaskbarFrame_MeasureOverride_Original;
+
+int WINAPI TaskbarFrame_MeasureOverride_Hook(
+    void* pThis,
+    winrt::Windows::Foundation::Size size,
+    winrt::Windows::Foundation::Size* resultSize) {
+    int ret = TaskbarFrame_MeasureOverride_Original(pThis, size, resultSize);
+    if (g_unloading.load()) return ret;
+    try {
+        FrameworkElement element = nullptr;
+        ((IUnknown*)pThis)->QueryInterface(winrt::guid_of<FrameworkElement>(), winrt::put_abi(element));
+        if (element && winrt::get_class_name(element) == L"Taskbar.TaskbarFrame") {
+            void* ctxKey = winrt::get_abi(element);
+            auto it = g_contexts.find(ctxKey);
+            if (it == g_contexts.end()) {
+                InitializeAnimationHooks(ctxKey, element);
+            } else if (g_settings.smoothLayoutTransition && !it->second.widthAnim) {
+                AttachDockWidthAnimator(it->second, element);
+            }
+        }
+    } catch (...) {}
+    return ret;
 }
 
 void LoadSettings() {
@@ -1283,6 +2328,7 @@ void LoadSettings() {
     if (g_settings.lerpSpeed > 60) g_settings.lerpSpeed = 60;
 
     g_settings.disableBounce = (bool)Wh_GetIntSetting(L"DisableBounce");
+    g_settings.smoothLayoutTransition = (bool)Wh_GetIntSetting(L"SmoothLayoutTransition");
 
     Wh_Log(L"DockAnimation: Settings loaded.");
 }
@@ -1309,6 +2355,14 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
             },
             &TaskbarFrame_OnPointerExited_Original,
             TaskbarFrame_OnPointerExited_Hook,
+        },
+        {
+            {
+                LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskbarFrame,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"
+            },
+            &TaskbarFrame_MeasureOverride_Original,
+            TaskbarFrame_MeasureOverride_Hook,
+            true,
         },
     };
     if (!HookSymbols(module, taskbarViewHooks, ARRAYSIZE(taskbarViewHooks))) {
@@ -1422,6 +2476,7 @@ bool RunFromWindowThread(HWND hWnd,
 void Wh_ModBeforeUninit() {
     Wh_Log(L"DockAnimation: Wh_ModBeforeUninit (safe cleanup)");
 
+    g_unloading = true;
     g_activeContextKey = nullptr;
     g_isBouncing = false;
     g_isMouseInside = false;
@@ -1446,6 +2501,7 @@ void Wh_ModBeforeUninit() {
                 try {
                     for (auto& pair : g_contexts) {
                         auto& ctx = pair.second;
+                        DetachDockWidthAnimator(ctx);
                         ResetAllIconScales(ctx.icons);
                     }
                     g_contexts.clear();
@@ -1465,15 +2521,32 @@ void Wh_ModBeforeUninit() {
 void Wh_ModSettingsChanged() {
     Wh_Log(L"DockAnimation: Settings changed.");
     LoadSettings();
-    try {
-        for (auto& pair : g_contexts) {
-            auto& ctx = pair.second;
-            ResetAllIconScales(ctx.icons);
-            ctx.isInitialized = false;
-            ctx.icons.clear();
-        }
-        g_isBouncing = false;
-    } catch (...) {
+
+    HWND hTaskbar = FindWindow(L"Shell_TrayWnd", NULL);
+    if (hTaskbar) {
+        RunFromWindowThread(
+            hTaskbar,
+            [](PVOID) {
+                try {
+                    for (auto& pair : g_contexts) {
+                        auto& ctx = pair.second;
+                        if (g_settings.smoothLayoutTransition) {
+                            if (!ctx.widthAnim) {
+                                if (auto tf = ctx.taskbarFrame.get()) {
+                                    AttachDockWidthAnimator(ctx, tf);
+                                }
+                            }
+                        } else {
+                            DetachDockWidthAnimator(ctx);
+                        }
+                        ResetAllIconScales(ctx.icons);
+                        ctx.isInitialized = false;
+                        ctx.icons.clear();
+                    }
+                    g_isBouncing = false;
+                } catch (...) {}
+            },
+            nullptr);
     }
 }
 
